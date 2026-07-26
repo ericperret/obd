@@ -11,9 +11,16 @@
  *           calculateur moteur CAN 500 kbit/s, ISO 15765
  *           Calculateur : Marelli MJD 8F3.F6 (confirme)
  * Auteur  : Eric Perret (F1OCM) - assistance Claude
- * Version : 2.9 - 2026-07-26
+ * Version : 3.0 - 2026-07-26
  * Licence : usage personnel
  * ------------------------------------------------------------
+ * v3.0 : CLOCK! regle l'horloge du bus (trame Nemo C28A000 BCD,
+ *        forme generique idhex pour autre vehicule). LOG CSV
+ *        horodate des PIDs de conduite : LOG ON/OFF [sec] en
+ *        console (defaut 30s), LOG? une ligne pour la page web
+ *        (timer JS 30s -> accumulation + telechargement CSV sur
+ *        Android). Horodatage lu depuis la trame horloge du bus.
+ *        Boutons Log/CSV/Horloge ajoutes a l'interface web.
  * v2.9 : decodage PID 01 (voyant MIL + nb defauts), 1C (norme
  *        OBD), 4A (pedale D).
  * v2.8 : decodage en clair SAE J1979 (30 PIDs mode 01, libelles
@@ -762,10 +769,149 @@ void cmdProbe(){
 }
 
 /* ============================================================
+ * Horodatage depuis la trame horloge du bus (C28A000, 29 bits)
+ * payload BCD hh mm ss MM JJ AA. Sniffe jusqu'a 250ms.
+ * Ecrit "AAAA-MM-JJ hh:mm:ss" dans buf (>=20). true si trouve.
+ * ============================================================ */
+#define ID29_CLOCK 0x0C28A000UL
+bool busTime(char *buf){ /* buf >= 28 */
+  uint32_t id; bool ext; uint8_t d[8];
+  uint32_t t0 = millis();
+  while(millis() - t0 < 250){
+    if(canRecvAny(&id, &ext, d) && ext && id == ID29_CLOCK){
+      /* BCD -> decimal */
+      uint8_t hh=(d[0]>>4)*10+(d[0]&0xF), mm=(d[1]>>4)*10+(d[1]&0xF),
+              ss=(d[2]>>4)*10+(d[2]&0xF), MM=(d[3]>>4)*10+(d[3]&0xF),
+              JJ=(d[4]>>4)*10+(d[4]&0xF), AA=(d[5]>>4)*10+(d[5]&0xF);
+      sprintf(buf, "20%02u-%02u-%02u %02u:%02u:%02u", AA, MM, JJ, hh, mm, ss);
+      return true;
+    }
+  }
+  return false;
+}
+
+/* ============================================================
+ * CLOCK! : ecrit date/heure sur le bus (trame horloge Nemo).
+ * Formes acceptees (heure fournie par le PC) :
+ *   CLOCK! hh mm ss JJ MM AA          -> trame Nemo C28A000
+ *   CLOCK! <idhex29> hh mm ss JJ MM AA-> autre vehicule
+ * Emet la trame 3 fois. NB: si le BSI reemet cette trame en
+ * continu, il peut reecraser la valeur (a tester par vehicule).
+ * ============================================================ */
+static uint8_t bcd(uint8_t v){ return ((v/10)<<4) | (v%10); }
+
+void cmdClock(const String &line){
+  /* tokenise sur les espaces                                    */
+  int tok[8], nt = 0, p = 0;
+  while(nt < 8){
+    int s = line.indexOf(' ', p);
+    if(s < 0){ if(p < (int)line.length()) tok[nt++] = p; break; }
+    if(s > p) tok[nt++] = p;
+    p = s + 1;
+  }
+  /* tok[0] = "CLOCK!" ; valeurs a partir de tok[1]              */
+  uint32_t frameId = ID29_CLOCK;
+  uint8_t off = 1;
+  if(nt == 8){                              /* id explicite      */
+    frameId = strtoul(line.substring(tok[1]).c_str(), NULL, 16);
+    off = 2;
+  }else if(nt != 7){
+    OUT->println("ERR: CLOCK! hh mm ss JJ MM AA  [ou  CLOCK! idhex hh mm ss JJ MM AA]");
+    return;
+  }
+  uint8_t val[6];
+  for(uint8_t i=0;i<6;i++)
+    val[i] = strtol(line.substring(tok[off+i]).c_str(), NULL, 10);
+  /* ordre trame Nemo : hh mm ss MM JJ AA (entree JJ MM AA)      */
+  uint8_t d[8] = { bcd(val[0]), bcd(val[1]), bcd(val[2]),
+                   bcd(val[4]), bcd(val[3]), bcd(val[5]), 0, 0 };
+  bool ok = true;
+  for(uint8_t k=0;k<3;k++){
+    if(!canSend29(frameId, d, 6)){ ok = false; break; }
+    delay(20);
+  }
+  if(!ok){ OUT->println("CLOCK FAIL"); return; }
+  OUT->print("CLOCK OK -> 20"); OUT->print(val[5]);
+  OUT->print("-"); OUT->print(val[4]); OUT->print("-"); OUT->print(val[3]);
+  OUT->print(" "); OUT->print(val[0]); OUT->print(":");
+  OUT->print(val[1]); OUT->print(":"); OUT->println(val[2]);
+}
+
+/* ============================================================
+ * LOG : releve CSV horodate des PIDs de conduite.
+ *   LOG?          -> une ligne CSV immediate (page web, timer JS)
+ *   LOG HEAD      -> ligne d'en-tete CSV
+ *   LOG ON [sec]  -> mode console : une ligne toutes les N s (30)
+ *   LOG OFF       -> stop
+ * Colonnes : horodatage,regime,eau,air,rail,map,maf,egr,charge,
+ *            pedale,vitesse,niveau
+ * ============================================================ */
+bool     logMode   = false;
+uint32_t logPeriod = 30000;
+uint32_t logNext   = 0;
+
+/* PID -> valeur numerique (float) ; NAN si absent              */
+static float pidVal(uint8_t pid){
+  uint8_t rq[2] = {0x01, pid}, rsp[TP_BUF];
+  uint16_t n = obdQuery(rq, 2, rsp, TP_BUF);
+  if(n < 3 || rsp[0]!=0x41 || rsp[1]!=pid) return NAN;
+  uint16_t AB = (n>=4) ? ((uint16_t)rsp[2]<<8 | rsp[3]) : 0;
+  uint8_t  A  = rsp[2];
+  switch(pid){
+    case 0x0C: return AB/4.0;
+    case 0x05: return (int)A-40;
+    case 0x0F: return (int)A-40;
+    case 0x23: return AB*10.0;
+    case 0x0B: return A;
+    case 0x10: return AB/100.0;
+    case 0x2C: return A*100.0/255.0;
+    case 0x04: return A*100.0/255.0;
+    case 0x49: return A*100.0/255.0;
+    case 0x0D: return A;
+    case 0x2F: return A*100.0/255.0;
+  }
+  return NAN;
+}
+
+static void logHeader(){
+  OUT->println("horodatage,regime_trmin,eau_C,air_C,rail_kPa,map_kPa,"
+               "maf_gs,egr_pct,charge_pct,pedale_pct,vitesse_kmh,niveau_pct");
+}
+
+void logLine(){
+  char ts[28];
+  if(!busTime(ts)){ sprintf(ts, "t+%lus", (unsigned long)(millis()/1000)); }
+  const uint8_t pids[11] = {0x0C,0x05,0x0F,0x23,0x0B,0x10,0x2C,0x04,0x49,0x0D,0x2F};
+  OUT->print(ts);
+  for(uint8_t i=0;i<11;i++){
+    OUT->print(',');
+    float v = pidVal(pids[i]);
+    if(v != v) OUT->print("");         /* NAN -> vide            */
+    else OUT->print(v, (pids[i]==0x10||pids[i]==0x23) ? 0 : 1);
+  }
+  OUT->println();
+}
+
+void cmdLog(const String &cmd){
+  if(cmd == "LOG?"){ logLine(); return; }
+  if(cmd == "LOG HEAD"){ logHeader(); return; }
+  if(cmd.startsWith("LOG ON")){
+    int sp = cmd.indexOf(' ', 4);
+    if(sp > 0){ long s = cmd.substring(sp+1).toInt(); if(s >= 1) logPeriod = s*1000UL; }
+    logMode = true; logNext = 0;         /* premiere ligne tout de suite */
+    logHeader();
+    OUT->print("LOG ON "); OUT->print(logPeriod/1000); OUT->println("s");
+    return;
+  }
+  if(cmd == "LOG OFF"){ logMode = false; OUT->println("LOG OFF"); return; }
+  OUT->println("ERR: LOG? | LOG HEAD | LOG ON [sec] | LOG OFF");
+}
+
+/* ============================================================
  * HELP? : rappel de toutes les commandes
  * ============================================================ */
 void cmdHelp(){
-  OUT->println("# --- Commandes obd_can_bridge v2.9 ---");
+  OUT->println("# --- Commandes obd_can_bridge v3.0 ---");
   OUT->println("# HELP?            cette aide");
   OUT->println("# PING?            test de vie -> PONG");
   OUT->println("# INFO?            identite ESP32 + MCP2515 + test SPI");
@@ -776,6 +922,9 @@ void cmdHelp(){
   OUT->println("# EGR?             consigne et erreur EGR (PID 2C/2D)");
   OUT->println("# PID <m> <p>      requete libre hexa + decodage, ex: PID 01 0C");
   OUT->println("# SCAN?            tous les PIDs supportes, en clair");
+  OUT->println("# LOG ON|OFF [s]   log CSV horodate (console, def. 30s)");
+  OUT->println("# LOG?             une ligne CSV (page web)");
+  OUT->println("# CLOCK! hh mm ss JJ MM AA   regle l'horloge du bus");
   OUT->println("# PROBE?           sonde adressage diag (11b/29b)");
   OUT->println("# SNIF ON|OFF      sniffer CAN brut (USB seulement)");
   OUT->println("# WiFi: SSID " AP_SSID " mdp " AP_PASS " -> http://192.168.1.1");
@@ -861,6 +1010,8 @@ void execCmd(const String &cmd, bool fromWeb){
   else if(cmd == "EGR?")         cmdEgr();
   else if(cmd == "PROBE?")       cmdProbe();
   else if(cmd == "SCAN?")        cmdScan();
+  else if(cmd.startsWith("CLOCK!")) cmdClock(cmd);
+  else if(cmd.startsWith("LOG"))    cmdLog(cmd);
   else if(cmd.startsWith("PID ")) cmdPid(cmd);
   else if(cmd == "SNIF ON"){
     if(fromWeb){ OUT->println("ERR USB SEULEMENT"); return; }
@@ -907,6 +1058,10 @@ const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html>
  <button onclick="cmd('EGR?')">&Eacute;tat EGR</button>
  <button onclick="cmd('INFO?')">Infos cartes</button>
  <button id="bClear" onclick="doClear()">EFFACER d&eacute;fauts</button>
+ <button onclick="cmd('SCAN?')">Scan complet</button>
+ <button id="bLog" onclick="toggleLog()">Log conduite</button>
+ <button onclick="dlLog()">T&eacute;l&eacute;charger CSV</button>
+ <button onclick="setClock()">R&eacute;gler l'horloge</button>
  <button onclick="cmd('HELP?')">Aide</button>
 </div>
 <div class="pid">
@@ -942,6 +1097,43 @@ async function cmd(c){
 function doClear(){
  if(confirm('Effacer tous les defauts et le voyant ?\nIrreversible : note les codes avant.'))
   cmd('CLEAR!');
+}
+let logTimer=null, logCSV='';
+async function raw(c){
+ const r=await fetch('/cmd?c='+encodeURIComponent(c));
+ return await r.text();
+}
+async function toggleLog(){
+ const b=document.getElementById('bLog');
+ if(logTimer){
+  clearInterval(logTimer); logTimer=null;
+  b.textContent='Log conduite'; b.style.background='';
+  add('# log arrete ('+(logCSV.split('\n').length-1)+' lignes)');
+  return;
+ }
+ logCSV=(await raw('LOG HEAD')).trim()+'\n';
+ b.textContent='Log EN COURS'; b.style.background='#2a8f4a';
+ add('# log demarre (releve toutes les 30s)');
+ const tick=async()=>{
+  const l=(await raw('LOG?')).trim();
+  if(l){ logCSV+=l+'\n'; add(l); }
+ };
+ await tick();
+ logTimer=setInterval(tick,30000);
+}
+function dlLog(){
+ if(!logCSV){ add('# aucun log a telecharger'); return; }
+ const a=document.createElement('a');
+ a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(logCSV);
+ a.download='log_nemo_'+Date.now()+'.csv';
+ a.click();
+}
+function setClock(){
+ const d=new Date();
+ const p=n=>String(n).padStart(2,'0');
+ const c='CLOCK! '+p(d.getHours())+' '+p(d.getMinutes())+' '+p(d.getSeconds())
+        +' '+p(d.getDate())+' '+p(d.getMonth()+1)+' '+p(d.getFullYear()%100);
+ cmd(c);
 }
 </script></body></html>)HTML";
 
@@ -1034,6 +1226,13 @@ void loop(){
       }
       Serial.println();
     }
+  }
+
+  /* mode log console : une ligne CSV toutes les logPeriod ms    */
+  if(logMode && millis() >= logNext){
+    logNext = millis() + logPeriod;
+    OUT = &Serial;
+    logLine();
   }
 
   /* lecture commande serie                                     */
