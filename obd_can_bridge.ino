@@ -11,9 +11,45 @@
  *           calculateur moteur CAN 500 kbit/s, ISO 15765
  *           Calculateur : Marelli MJD 8F3.F6 (confirme)
  * Auteur  : Eric Perret (F1OCM) - assistance Claude
- * Version : 3.0 - 2026-07-26
+ * Version : 3.2 - 2026-08-06
  * Licence : usage personnel
  * ------------------------------------------------------------
+ * v3.2 : LOG rendu AUTONOME. En v3.1 l'acquisition tournait bien
+ *        dans le module mais le CSV etait accumule par le
+ *        navigateur (une requete toutes les 2 s) : telephone en
+ *        veille = plus de requetes = fichier vide au retour.
+ *        Desormais le module ecrit lui-meme /log.csv en flash
+ *        (LittleFS) et le sert en telechargement direct sur
+ *        http://192.168.1.1/log.csv. Le telephone ne sert plus
+ *        qu'a lancer et arreter : ecran eteint, page fermee ou
+ *        WiFi coupe, l'enregistrement continue, et il survit
+ *        meme a un reset du module.
+ *        Repli tampon RAM 900 lignes si la partition LittleFS
+ *        est absente, non circulaire (arret quand plein).
+ *        Bornage du temps de cycle : pendant le log un seul
+ *        adressage diagnostic est essaye (obdNoFallback), budget
+ *        par echantillon, et une colonne muette 5 fois de suite
+ *        est retiree du releve. LOG STAT et LOG LAST pour
+ *        controler sans telecharger.
+ * v3.1 : LOG refondu pour l'analyse turbo/injection.
+ *        Cadence 3 Hz par defaut (LOG ON [ms], mini 100 ms),
+ *        acquisition en tampon RAM circulaire (1200 lignes) et
+ *        purge par blocs (LOG XX) : la page web ne fait plus
+ *        qu'une requete HTTP toutes les 2 s.
+ *        Horodatage milliseconde : base prise une seule fois sur
+ *        la trame horloge du bus a LOG ON puis derive millis()
+ *        (l'ecoute bloquante de 250 ms par ligne est supprimee).
+ *        19 colonnes, dont pression rail (0x23), consigne de
+ *        suralimentation (0x70), position turbo VGT consigne et
+ *        reelle (0x71), temperature air apres echangeur (0x77),
+ *        erreur EGR (0x2D). Les colonnes non supportees par le
+ *        calculateur sont detectees a LOG ON via les bitmaps
+ *        00/20/40/60/80 et laissees vides sans cout de timeout.
+ *        Colonnes lentes (temperatures, niveau) : 1 releve sur 10.
+ *        Pression rail consignee et debit IMV n'existent pas en
+ *        SAE J1979 : commandes DID / DIDSCAN (UDS mode 22) pour
+ *        les localiser, DIDMAP RAIL|IMV pour les cabler dans le
+ *        CSV. SUPPORT? liste les PIDs reellement disponibles.
  * v3.0 : CLOCK! regle l'horloge du bus (trame Nemo C28A000 BCD,
  *        forme generique idhex pour autre vehicule). LOG CSV
  *        horodate des PIDs de conduite : LOG ON/OFF [sec] en
@@ -100,6 +136,9 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <StreamString.h>
+#include <time.h>
+#include <FS.h>
+#include <LittleFS.h>
 
 /* ---------- WiFi point d'acces ------------------------------ */
 #define AP_SSID   "NEMO-OBD"
@@ -438,7 +477,8 @@ void ledBlip(){
  * ============================================================ */
 #define ID29_FUNC 0x18DB33F1UL
 #define ID29_PHYS 0x18DA10F1UL
-uint8_t obdAddrPref = 0;   /* 0=29b func, 1=29b phys, 2=7DF, 3=7E0 */
+uint8_t obdAddrPref  = 0;  /* 0=29b func, 1=29b phys, 2=7DF, 3=7E0    */
+bool    obdNoFallback = false; /* true : un seul adressage essaye     */
 
 static bool obdIsRsp(uint32_t id, bool ext){
   if(ext)  return (id & 0xFFFFFF00UL) == 0x18DAF100UL;
@@ -471,7 +511,8 @@ uint16_t obdQuery(const uint8_t *req, uint8_t reqLen,
   ordre[0] = obdAddrPref;
   for(uint8_t k=0, w=1; k<4; k++) if(k != obdAddrPref) ordre[w++] = k;
 
-  for(uint8_t e=0; e<4; e++){
+  uint8_t nEssai = obdNoFallback ? 1 : 4;
+  for(uint8_t e=0; e<nEssai; e++){
     uint8_t essai = ordre[e];
     if(!obdTx(essai, f)){
       OUT->print("# TX FAIL: trame non emise (EFLG=0x");
@@ -838,80 +879,603 @@ void cmdClock(const String &line){
 }
 
 /* ============================================================
- * LOG : releve CSV horodate des PIDs de conduite.
- *   LOG?          -> une ligne CSV immediate (page web, timer JS)
- *   LOG HEAD      -> ligne d'en-tete CSV
- *   LOG ON [sec]  -> mode console : une ligne toutes les N s (30)
- *   LOG OFF       -> stop
- * Colonnes : horodatage,regime,eau,air,rail,map,maf,egr,charge,
- *            pedale,vitesse,niveau
+ * LOG v3.2 : enregistreur AUTONOME.
+ * Une fois LOG ON lance, l'acquisition tourne dans le module,
+ * sans aucune participation du telephone : l'ecran peut etre
+ * eteint, le WiFi coupe, la page fermee. L'export se fait au
+ * retour, en telechargeant http://192.168.1.1/log.csv
+ *   LOG ON [ms]   demarre (defaut 333 ms = 3 Hz, mini 100)
+ *                 ecrase l'enregistrement precedent
+ *   LOG OFF       arrete (le fichier reste disponible)
+ *   LOG STAT      etat, cadence reelle, nb de lignes, stockage
+ *   LOG LAST      derniere ligne acquise (controle rapide)
+ *   LOG?          un releve immediat, hors enregistrement
+ *   LOG HEAD      ligne d'en-tete CSV
+ *   LOG DUMP      deversement CSV sur USB (console seulement)
+ * Stockage : fichier /log.csv en flash (LittleFS) -> survit a
+ * une coupure ou un reset. Si la partition est absente, repli
+ * sur un tampon RAM de LOG_RAM lignes (non circulaire : l'enre-
+ * gistrement s'arrete quand il est plein, rien n'est ecrase).
+ * Colonnes absentes du calculateur : cellule vide.
+ * Colonnes lentes (temperatures, niveau) : 1 releve sur 10.
+ * Horodatage : base prise sur la trame horloge du bus a LOG ON
+ * puis derive millis() -> resolution milliseconde.
  * ============================================================ */
+#define LOG_NCOL   19
+#define LOG_RAM    900         /* lignes du tampon de repli (~5 min)  */
+#define LOG_ABS    (-32768)    /* marqueur "valeur absente"           */
+#define LOG_SLOWN  10          /* diviseur des colonnes lentes        */
+#define LOG_STRIKE 5           /* NO_DATA consecutifs -> colonne coupee*/
+#define LOG_FICH   "/log.csv"
+
+struct LogCol {
+  uint8_t     pid;   /* PID mode 01 ; 0x00 = source DID (mode 22)     */
+  uint8_t     sub;   /* index de sous-valeur (ou n0 de slot DID)      */
+  float       step;  /* valeur reelle = brut_int16 * step             */
+  bool        slow;  /* echantillonne 1 cycle sur LOG_SLOWN           */
+  const char *nom;
+};
+
+const LogCol LOGCOL[LOG_NCOL] = {
+  {0x0C, 0, 0.25f, false, "regime_trmin"  },
+  {0x05, 0, 1.0f , true , "eau_C"         },
+  {0x0F, 0, 1.0f , true , "air_C"         },
+  {0x77, 0, 1.0f , true , "cact_C"        },  /* apres echangeur      */
+  {0x23, 0, 10.0f, false, "rail_kPa"      },
+  {0x00, 0, 10.0f, false, "rail_cons_kPa" },  /* DIDMAP RAIL          */
+  {0x0B, 0, 1.0f , false, "map_kPa"       },
+  {0x70, 0, 0.5f , false, "boost_cons_kPa"},
+  {0x70, 1, 0.5f , false, "boost_reel_kPa"},
+  {0x10, 0, 0.01f, false, "maf_gs"        },
+  {0x2C, 0, 0.1f , false, "egr_cons_pct"  },
+  {0x2D, 0, 0.1f , false, "egr_err_pct"   },
+  {0x71, 0, 0.1f , false, "vgt_cons_pct"  },
+  {0x71, 1, 0.1f , false, "vgt_reel_pct"  },
+  {0x00, 1, 0.1f , false, "imv_pct"       },  /* DIDMAP IMV           */
+  {0x04, 0, 0.1f , false, "charge_pct"    },
+  {0x49, 0, 0.1f , false, "pedale_pct"    },
+  {0x0D, 0, 1.0f , false, "vitesse_kmh"   },
+  {0x2F, 0, 0.1f , true , "niveau_pct"    }
+};
+
+/* ---- slots DID constructeur (mode 22), pour rail consigne / IMV --
+ * valeur = (2 octets a l'index idx de la reponse) * gain + off
+ * Renseignes par DIDMAP apres identification via DID / DIDSCAN.    */
+struct DidMap { uint16_t did; uint8_t idx; float gain; float off; bool on; };
+DidMap didLog[2] = { {0,0,1.0f,0.0f,false}, {0,0,1.0f,0.0f,false} };
+
+bool     cmdWeb    = false;      /* requete venue de la page web    */
 bool     logMode   = false;
-uint32_t logPeriod = 30000;
+bool     logEcho   = false;      /* recopie live sur USB            */
+uint32_t logPeriod = 333;        /* ms -> 3 Hz                      */
 uint32_t logNext   = 0;
+uint32_t logT0     = 0;
+uint32_t logEpoch  = 0;          /* secondes UTC de reference       */
+uint32_t logEpochMs= 0;
+uint16_t logDur    = 0;          /* duree du dernier cycle (ms)     */
+uint32_t logCycle  = 0;
+uint32_t logLines  = 0;          /* lignes enregistrees             */
+uint32_t logTrunc  = 0;          /* cycles tronques (budget depasse)*/
+bool     logSupOk  = false;
+bool     logPlein  = false;
+bool     logSup[LOG_NCOL];
+uint8_t  logStrike[LOG_NCOL];
+int16_t  logLast[LOG_NCOL];
+uint32_t logLastMs = 0;
 
-/* PID -> valeur numerique (float) ; NAN si absent              */
-static float pidVal(uint8_t pid){
-  uint8_t rq[2] = {0x01, pid}, rsp[TP_BUF];
-  uint16_t n = obdQuery(rq, 2, rsp, TP_BUF);
-  if(n < 3 || rsp[0]!=0x41 || rsp[1]!=pid) return NAN;
-  uint16_t AB = (n>=4) ? ((uint16_t)rsp[2]<<8 | rsp[3]) : 0;
-  uint8_t  A  = rsp[2];
-  switch(pid){
-    case 0x0C: return AB/4.0;
-    case 0x05: return (int)A-40;
-    case 0x0F: return (int)A-40;
-    case 0x23: return AB*10.0;
-    case 0x0B: return A;
-    case 0x10: return AB/100.0;
-    case 0x2C: return A*100.0/255.0;
-    case 0x04: return A*100.0/255.0;
-    case 0x49: return A*100.0/255.0;
-    case 0x0D: return A;
-    case 0x2F: return A*100.0/255.0;
+/* ---- stockage : flash LittleFS, ou tampon RAM en repli ----------- */
+File     logFile;
+bool     logFs = false;
+static int16_t  logBuf[LOG_RAM][LOG_NCOL];
+static uint32_t logBufMs[LOG_RAM];
+static uint16_t logCount = 0;
+
+/* ---- horodatage -------------------------------------------------- */
+static uint32_t epochFrom(uint16_t y, uint8_t m, uint8_t d,
+                          uint8_t hh, uint8_t mi, uint8_t ss){
+  y -= (m <= 2);
+  int32_t  era = (int32_t)y / 400;
+  uint32_t yoe = y - era * 400;
+  uint32_t doy = (153u * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  int32_t  jours = era * 146097 + (int32_t)doe - 719468;
+  return (uint32_t)jours * 86400UL + hh * 3600UL + mi * 60UL + ss;
+}
+
+static bool logClockBase(){
+  uint32_t id; bool ext; uint8_t d[8];
+  uint32_t t0 = millis();
+  while(millis() - t0 < 300){
+    if(canRecvAny(&id, &ext, d) && ext && id == ID29_CLOCK){
+      uint8_t hh=(d[0]>>4)*10+(d[0]&0xF), mi=(d[1]>>4)*10+(d[1]&0xF),
+              ss=(d[2]>>4)*10+(d[2]&0xF), MM=(d[3]>>4)*10+(d[3]&0xF),
+              JJ=(d[4]>>4)*10+(d[4]&0xF), AA=(d[5]>>4)*10+(d[5]&0xF);
+      logEpoch   = epochFrom(2000 + AA, MM, JJ, hh, mi, ss);
+      logEpochMs = millis();
+      return true;
+    }
   }
-  return NAN;
+  logEpoch = 0;
+  return false;
 }
 
-static void logHeader(){
-  OUT->println("horodatage,regime_trmin,eau_C,air_C,rail_kPa,map_kPa,"
-               "maf_gs,egr_pct,charge_pct,pedale_pct,vitesse_kmh,niveau_pct");
+static void logTs(uint32_t ms, char *buf){   /* buf >= 32 */
+  if(logEpoch){
+    uint32_t dt = ms - logEpochMs;
+    time_t   t  = (time_t)(logEpoch + dt / 1000UL);
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    sprintf(buf, "%04d-%02d-%02d %02d:%02d:%02d.%03u",
+            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+            tm.tm_hour, tm.tm_min, tm.tm_sec, (unsigned)(dt % 1000UL));
+  }else{
+    uint32_t dt = ms - logT0;
+    sprintf(buf, "t+%lu.%03u",
+            (unsigned long)(dt / 1000UL), (unsigned)(dt % 1000UL));
+  }
 }
 
-void logLine(){
-  char ts[28];
-  if(!busTime(ts)){ sprintf(ts, "t+%lus", (unsigned long)(millis()/1000)); }
-  const uint8_t pids[11] = {0x0C,0x05,0x0F,0x23,0x0B,0x10,0x2C,0x04,0x49,0x0D,0x2F};
-  OUT->print(ts);
-  for(uint8_t i=0;i<11;i++){
-    OUT->print(',');
-    float v = pidVal(pids[i]);
-    if(v != v) OUT->print("");         /* NAN -> vide            */
-    else OUT->print(v, (pids[i]==0x10||pids[i]==0x23) ? 0 : 1);
+/* ---- decodage des PIDs du log (jusqu'a 2 valeurs par PID) --------- */
+static uint8_t pidDecodeLog(uint8_t pid, const uint8_t *d, uint16_t n, float *o){
+  if(n < 1) return 0;
+  uint8_t  A  = d[0];
+  uint16_t AB = (n >= 2) ? (((uint16_t)d[0] << 8) | d[1]) : 0;
+  switch(pid){
+    case 0x0C: if(n<2) return 0; o[0] = AB / 4.0f;            return 1;
+    case 0x05:
+    case 0x0F: o[0] = (float)((int)A - 40);                   return 1;
+    case 0x0B: o[0] = A;                                      return 1;
+    case 0x0D: o[0] = A;                                      return 1;
+    case 0x23: if(n<2) return 0; o[0] = AB * 10.0f;           return 1;
+    case 0x10: if(n<2) return 0; o[0] = AB / 100.0f;          return 1;
+    case 0x04:
+    case 0x2C:
+    case 0x2F:
+    case 0x49: o[0] = A * 100.0f / 255.0f;                    return 1;
+    case 0x2D: o[0] = ((int)A - 128) * 100.0f / 128.0f;       return 1;
+    /* 0x70 commande de suralimentation : A drapeaux, B/C consigne,
+       D/E reelle, echelle 0,03125 kPa/bit                            */
+    case 0x70: if(n < 5) return 0;
+               o[0] = (((uint16_t)d[1] << 8) | d[2]) * 0.03125f;
+               o[1] = (((uint16_t)d[3] << 8) | d[4]) * 0.03125f;
+               return 2;
+    /* 0x71 turbo a geometrie variable : A drapeaux, B consigne %,
+       C position reelle %                                            */
+    case 0x71: if(n < 3) return 0;
+               o[0] = d[1] * 100.0f / 255.0f;
+               o[1] = d[2] * 100.0f / 255.0f;
+               return 2;
+    /* 0x77 temperature air apres echangeur : A drapeaux, B capteur 1 */
+    case 0x77: if(n < 2) return 0;
+               o[0] = (float)((int)d[1] - 40);
+               return 1;
+  }
+  return 0;
+}
+
+/* ---- table des PIDs supportes (bitmaps 00/20/40/60/80...) --------- */
+static uint8_t logSupBits[32];
+
+static bool supBit(uint8_t p){ return logSupBits[p >> 3] & (0x80 >> (p & 7)); }
+
+static void logBuildSup(){
+  for(uint8_t i=0;i<32;i++) logSupBits[i] = 0;
+  uint8_t rsp[TP_BUF];
+  for(uint8_t page=0; page<8; page++){
+    uint8_t base = page * 0x20;
+    uint8_t rq[2] = {0x01, base};
+    uint16_t n = obdQuery(rq, 2, rsp, TP_BUF);
+    if(n < 6 || rsp[0] != 0x41 || rsp[1] != base) break;
+    uint32_t bm = ((uint32_t)rsp[2]<<24)|((uint32_t)rsp[3]<<16)
+                | ((uint32_t)rsp[4]<<8)|rsp[5];
+    for(uint8_t b=0;b<32;b++){
+      if(!(bm & (0x80000000UL >> b))) continue;
+      uint8_t p = base + 1 + b;
+      logSupBits[p >> 3] |= (0x80 >> (p & 7));
+    }
+    if(!(bm & 1)) break;
+  }
+  for(uint8_t i=0;i<LOG_NCOL;i++){
+    logStrike[i] = 0;
+    if(LOGCOL[i].pid == 0x00) logSup[i] = didLog[LOGCOL[i].sub].on;
+    else                      logSup[i] = supBit(LOGCOL[i].pid);
+  }
+  logSupOk = true;
+}
+
+/* ---- conversion valeur reelle -> entier stocke, avec saturation --- */
+static int16_t logEnc(float v, float step){
+  long x = lroundf(v / step);
+  if(x >  32767) x =  32767;
+  if(x < -32767) x = -32767;
+  return (int16_t)x;
+}
+
+/* ---- acquisition d'un echantillon --------------------------------- */
+static void logAcquire(int16_t *val, uint32_t *ms, bool force){
+  uint32_t t0 = millis();
+  uint32_t budget = (logPeriod > 150) ? (logPeriod - 60) : logPeriod;
+  uint8_t  fait[LOG_NCOL], nFait = 0;
+  for(uint8_t i=0;i<LOG_NCOL;i++) val[i] = logLast[i];
+
+  bool sauve = obdNoFallback;
+  obdNoFallback = !force;    /* en log : pas de re-essai des 4 adressages */
+
+  for(uint8_t i=0;i<LOG_NCOL;i++){
+    if(!logSup[i]){ val[i] = LOG_ABS; continue; }
+    if(!force && millis() - t0 > budget){ logTrunc++; break; }
+    if(LOGCOL[i].slow && !force && (logCycle % LOG_SLOWN)) continue;
+
+    uint8_t p = LOGCOL[i].pid;
+
+    if(p == 0x00){                              /* slot DID mode 22   */
+      DidMap &m = didLog[LOGCOL[i].sub];
+      uint8_t rq[3] = {0x22, (uint8_t)(m.did >> 8), (uint8_t)(m.did & 0xFF)};
+      uint8_t rsp[TP_BUF];
+      uint16_t n = obdQuery(rq, 3, rsp, TP_BUF);
+      if(n >= (uint16_t)(5 + m.idx) && rsp[0] == 0x62){
+        uint16_t brut = ((uint16_t)rsp[3 + m.idx] << 8) | rsp[4 + m.idx];
+        val[i] = logEnc(brut * m.gain + m.off, LOGCOL[i].step);
+        logStrike[i] = 0;
+      }else{
+        val[i] = LOG_ABS;
+        if(++logStrike[i] >= LOG_STRIKE) logSup[i] = false;
+      }
+      continue;
+    }
+
+    bool deja = false;
+    for(uint8_t k=0;k<nFait;k++) if(fait[k] == p){ deja = true; break; }
+    if(deja) continue;
+    fait[nFait++] = p;
+
+    uint8_t rq[2] = {0x01, p}, rsp[TP_BUF];
+    uint16_t n = obdQuery(rq, 2, rsp, TP_BUF);
+    float o[2]; uint8_t no = 0;
+    if(n >= 3 && rsp[0] == 0x41 && rsp[1] == p)
+      no = pidDecodeLog(p, rsp + 2, n - 2, o);
+    for(uint8_t j=i;j<LOG_NCOL;j++){
+      if(LOGCOL[j].pid != p) continue;
+      if(LOGCOL[j].sub < no){
+        val[j] = logEnc(o[LOGCOL[j].sub], LOGCOL[j].step);
+        logStrike[j] = 0;
+      }else{
+        val[j] = LOG_ABS;
+        if(++logStrike[j] >= LOG_STRIKE) logSup[j] = false;
+      }
+    }
+  }
+
+  obdNoFallback = sauve;
+  for(uint8_t i=0;i<LOG_NCOL;i++) logLast[i] = val[i];
+  logCycle++;
+  *ms       = t0;
+  logLastMs = t0;
+  logDur    = (uint16_t)(millis() - t0);
+}
+
+/* ---- mise en forme CSV -------------------------------------------- */
+static void logHeaderText(char *out, size_t max){
+  size_t k = snprintf(out, max, "horodatage");
+  for(uint8_t i=0;i<LOG_NCOL && k<max;i++)
+    k += snprintf(out + k, max - k, ",%s", LOGCOL[i].nom);
+}
+
+static void logRowText(uint32_t ms, const int16_t *v, char *out, size_t max){
+  char ts[32];
+  logTs(ms, ts);
+  size_t k = snprintf(out, max, "%s", ts);
+  for(uint8_t i=0;i<LOG_NCOL && k<max;i++){
+    if(v[i] == LOG_ABS){ k += snprintf(out + k, max - k, ","); continue; }
+    uint8_t dec = (LOGCOL[i].step >= 1.0f) ? 0
+                : (LOGCOL[i].step >= 0.1f) ? 1 : 2;
+    k += snprintf(out + k, max - k, ",%.*f",
+                  dec, (double)(v[i] * LOGCOL[i].step));
+  }
+}
+
+/* ---- ouverture du stockage ---------------------------------------- */
+static bool logOpen(){
+  logCount = 0;
+  logLines = 0;
+  logPlein = false;
+  char buf[320];
+  logHeaderText(buf, sizeof(buf));
+  if(logFile) logFile.close();
+  if(LittleFS.begin(true)){
+    LittleFS.remove(LOG_FICH);
+    logFile = LittleFS.open(LOG_FICH, "w");
+    if(logFile){
+      logFile.println(buf);
+      logFile.flush();
+      logFs = true;
+      return true;
+    }
+  }
+  logFs = false;                  /* repli tampon RAM */
+  return false;
+}
+
+static void logStore(uint32_t ms, const int16_t *v){
+  if(logPlein) return;
+  if(logFs){
+    char buf[320];
+    logRowText(ms, v, buf, sizeof(buf));
+    logFile.println(buf);
+    logLines++;
+    if((logLines % 15) == 0) logFile.flush();
+    return;
+  }
+  if(logCount >= LOG_RAM){
+    logPlein = true;
+    logMode  = false;
+    Serial.println("# LOG : tampon RAM plein, enregistrement arrete");
+    return;
+  }
+  logBufMs[logCount] = ms;
+  for(uint8_t i=0;i<LOG_NCOL;i++) logBuf[logCount][i] = v[i];
+  logCount++;
+  logLines++;
+}
+
+void logTick(){                          /* appele par loop()          */
+  int16_t v[LOG_NCOL]; uint32_t ms;
+  logAcquire(v, &ms, false);
+  logStore(ms, v);
+  if(logEcho){
+    char buf[320];
+    logRowText(ms, v, buf, sizeof(buf));
+    Serial.println(buf);
+  }
+}
+
+void logLine(){                          /* releve unique, hors log    */
+  if(!logSupOk) logBuildSup();
+  if(!logEpoch){ logClockBase(); logT0 = millis(); }
+  int16_t v[LOG_NCOL]; uint32_t ms;
+  char buf[320];
+  logAcquire(v, &ms, true);
+  logRowText(ms, v, buf, sizeof(buf));
+  OUT->println(buf);
+}
+
+/* ---- export : ecrit tout le CSV vers un flux ---------------------- */
+static void logWriteCsv(Print *p){
+  char buf[320];
+  if(logFs){
+    if(logFile) logFile.flush();
+    File f = LittleFS.open(LOG_FICH, "r");
+    if(!f) return;
+    while(f.available()){
+      String l = f.readStringUntil('\n');
+      p->println(l);
+    }
+    f.close();
+    return;
+  }
+  logHeaderText(buf, sizeof(buf));
+  p->println(buf);
+  for(uint16_t k=0;k<logCount;k++){
+    logRowText(logBufMs[k], logBuf[k], buf, sizeof(buf));
+    p->println(buf);
+  }
+}
+
+static void logStat(){
+  uint8_t act = 0;
+  for(uint8_t i=0;i<LOG_NCOL;i++) if(logSup[i]) act++;
+  OUT->print("# LOG "); OUT->print(logMode ? "EN COURS" : "arrete");
+  OUT->print(" - periode "); OUT->print(logPeriod); OUT->print("ms (");
+  OUT->print(1000.0 / (double)logPeriod, 1); OUT->print(" Hz)");
+  OUT->print(" cycle mesure "); OUT->print(logDur); OUT->println("ms");
+  OUT->print("# lignes "); OUT->print(logLines);
+  OUT->print(" - stockage ");
+  if(logFs){
+    OUT->print("flash ");
+    OUT->print(LOG_FICH);
+    if(logFile){
+      OUT->print(" ("); OUT->print(logFile.size()); OUT->print(" o)");
+    }
+  }else{
+    OUT->print("RAM "); OUT->print(logCount); OUT->print("/"); OUT->print(LOG_RAM);
+  }
+  OUT->println(logPlein ? " PLEIN" : "");
+  OUT->print("# colonnes actives "); OUT->print(act);
+  OUT->print("/"); OUT->print(LOG_NCOL);
+  OUT->print(" - cycles tronques "); OUT->println(logTrunc);
+  OUT->print("# horodatage ");
+  OUT->println(logEpoch ? "horloge bus" : "relatif (trame horloge absente)");
+  OUT->print("# absentes :");
+  for(uint8_t i=0;i<LOG_NCOL;i++)
+    if(!logSup[i]){ OUT->print(' '); OUT->print(LOGCOL[i].nom); }
+  OUT->println();
+  OUT->println("# export : http://192.168.1.1/log.csv");
+}
+
+void cmdLog(const String &cmd){
+  if(cmd == "LOG?"){     logLine(); return; }
+  if(cmd == "LOG STAT"){ logStat(); return; }
+  if(cmd == "LOG HEAD"){
+    char buf[320]; logHeaderText(buf, sizeof(buf)); OUT->println(buf); return;
+  }
+  if(cmd == "LOG LAST"){
+    if(!logLastMs){ OUT->println("NO_DATA"); return; }
+    char buf[320]; logRowText(logLastMs, logLast, buf, sizeof(buf));
+    OUT->println(buf); return;
+  }
+  if(cmd == "LOG DUMP"){
+    if(cmdWeb){
+      OUT->println("ERR USB SEULEMENT - utiliser http://192.168.1.1/log.csv");
+      return;
+    }
+    logWriteCsv(&Serial);
+    return;
+  }
+  if(cmd.startsWith("LOG ON")){
+    int sp = cmd.indexOf(' ', 6);
+    if(sp > 0){
+      long v = cmd.substring(sp + 1).toInt();
+      if(v >= 100) logPeriod = (uint32_t)v;
+    }
+    logBuildSup();
+    logClockBase();
+    logT0    = millis();
+    logCycle = 0;
+    logTrunc = 0;
+    logLastMs= 0;
+    for(uint8_t i=0;i<LOG_NCOL;i++) logLast[i] = LOG_ABS;
+    logOpen();
+    logMode = true;
+    logEcho = !cmdWeb;                 /* recopie live sur USB seul   */
+    logNext = millis();
+    OUT->print("LOG ON "); OUT->print(logPeriod); OUT->print("ms (");
+    OUT->print(1000.0 / (double)logPeriod, 1); OUT->print(" Hz) stockage ");
+    OUT->println(logFs ? "flash" : "RAM");
+    logStat();
+    return;
+  }
+  if(cmd == "LOG OFF"){
+    logMode = false;
+    if(logFs && logFile) logFile.flush();
+    OUT->print("LOG OFF "); OUT->print(logLines); OUT->println(" ligne(s)");
+    OUT->println("# export : http://192.168.1.1/log.csv");
+    return;
+  }
+  OUT->println("ERR: LOG ON [ms] | LOG OFF | LOG STAT | LOG LAST | LOG? | LOG HEAD | LOG DUMP");
+}
+
+/* ============================================================
+ * SUPPORT? : liste des PIDs mode 01 reellement supportes
+ * ============================================================ */
+void cmdSupport(){
+  logBuildSup();
+  uint8_t nb = 0;
+  OUT->print("# PIDs supportes :");
+  for(uint16_t p=1;p<=0xFF;p++){
+    if(!supBit((uint8_t)p)) continue;
+    OUT->print(' ');
+    if(p < 16) OUT->print('0');
+    OUT->print(p, HEX);
+    nb++;
+  }
+  OUT->println();
+  OUT->print("# colonnes de log absentes :");
+  for(uint8_t i=0;i<LOG_NCOL;i++)
+    if(!logSup[i]){ OUT->print(' '); OUT->print(LOGCOL[i].nom); }
+  OUT->println();
+  OUT->print("SUPPORT OK "); OUT->print(nb); OUT->println(" PID(s)");
+}
+
+/* ============================================================
+ * DID : lecture d'identifiant constructeur (UDS mode 22).
+ *   DID <hex4>              -> reponse brute
+ *   DIDSCAN <hex4> <n>      -> balayage de n identifiants (max 256)
+ *   DIDMAP RAIL|IMV <hex4> <idx> <gain> [offset]
+ *   DIDMAP OFF              -> desactive les deux slots
+ * Sert a localiser pression rail consignee et debit IMV, absents
+ * du jeu standard SAE J1979.
+ * ============================================================ */
+static bool didRead(uint16_t did, uint8_t *rsp, uint16_t *n){
+  uint8_t rq[3] = {0x22, (uint8_t)(did >> 8), (uint8_t)(did & 0xFF)};
+  *n = obdQuery(rq, 3, rsp, TP_BUF);
+  return (*n >= 3 && rsp[0] == 0x62);
+}
+
+void cmdDid(const String &cmd){
+  long v = strtol(cmd.substring(4).c_str(), NULL, 16);
+  uint8_t rsp[TP_BUF]; uint16_t n;
+  if(!didRead((uint16_t)v, rsp, &n)){ OUT->println("NO_DATA"); return; }
+  OUT->print("DID ");
+  if(v < 0x1000) OUT->print('0');
+  OUT->print(v, HEX);
+  OUT->print(" :");
+  for(uint16_t i=3;i<n;i++){
+    OUT->print(' ');
+    if(rsp[i] < 16) OUT->print('0');
+    OUT->print(rsp[i], HEX);
   }
   OUT->println();
 }
 
-void cmdLog(const String &cmd){
-  if(cmd == "LOG?"){ logLine(); return; }
-  if(cmd == "LOG HEAD"){ logHeader(); return; }
-  if(cmd.startsWith("LOG ON")){
-    int sp = cmd.indexOf(' ', 4);
-    if(sp > 0){ long s = cmd.substring(sp+1).toInt(); if(s >= 1) logPeriod = s*1000UL; }
-    logMode = true; logNext = 0;         /* premiere ligne tout de suite */
-    logHeader();
-    OUT->print("LOG ON "); OUT->print(logPeriod/1000); OUT->println("s");
+void cmdDidScan(const String &cmd){
+  int s1 = cmd.indexOf(' ');
+  int s2 = cmd.indexOf(' ', s1 + 1);
+  if(s1 < 0 || s2 < 0){ OUT->println("ERR: DIDSCAN <hex4> <n>"); return; }
+  uint16_t deb = (uint16_t)strtol(cmd.substring(s1 + 1, s2).c_str(), NULL, 16);
+  long     nb  = cmd.substring(s2 + 1).toInt();
+  if(nb < 1)   nb = 1;
+  if(nb > 256) nb = 256;
+  uint8_t rsp[TP_BUF]; uint16_t n; uint16_t trouve = 0;
+  bool sauve = obdNoFallback;
+  obdNoFallback = true;              /* balayage : 1 seul adressage   */
+  for(long k=0;k<nb;k++){
+    uint16_t did = (uint16_t)(deb + k);
+    if(!didRead(did, rsp, &n)) continue;
+    trouve++;
+    OUT->print("# ");
+    if(did < 0x1000) OUT->print('0');
+    OUT->print(did, HEX);
+    OUT->print(" :");
+    for(uint16_t i=3;i<n;i++){
+      OUT->print(' ');
+      if(rsp[i] < 16) OUT->print('0');
+      OUT->print(rsp[i], HEX);
+    }
+    OUT->println();
+  }
+  obdNoFallback = sauve;
+  OUT->print("DIDSCAN OK "); OUT->print(trouve); OUT->println(" reponse(s)");
+}
+
+void cmdDidMap(const String &cmd){
+  if(cmd == "DIDMAP OFF"){
+    didLog[0].on = didLog[1].on = false;
+    logSupOk = false;
+    OUT->println("DIDMAP OFF");
     return;
   }
-  if(cmd == "LOG OFF"){ logMode = false; OUT->println("LOG OFF"); return; }
-  OUT->println("ERR: LOG? | LOG HEAD | LOG ON [sec] | LOG OFF");
+  if(cmd == "DIDMAP?" || cmd == "DIDMAP"){
+    for(uint8_t k=0;k<2;k++){
+      OUT->print("# "); OUT->print(k == 0 ? "RAIL " : "IMV  ");
+      if(!didLog[k].on){ OUT->println("(non defini)"); continue; }
+      OUT->print("DID "); OUT->print(didLog[k].did, HEX);
+      OUT->print(" idx "); OUT->print(didLog[k].idx);
+      OUT->print(" gain "); OUT->print(didLog[k].gain, 4);
+      OUT->print(" offset "); OUT->println(didLog[k].off, 2);
+    }
+    return;
+  }
+  int s1 = cmd.indexOf(' ');
+  int s2 = cmd.indexOf(' ', s1 + 1);
+  int s3 = cmd.indexOf(' ', s2 + 1);
+  int s4 = cmd.indexOf(' ', s3 + 1);
+  if(s1 < 0 || s2 < 0 || s3 < 0 || s4 < 0){
+    OUT->println("ERR: DIDMAP RAIL|IMV <hex4> <idx> <gain> [offset]");
+    return;
+  }
+  String qui = cmd.substring(s1 + 1, s2);
+  uint8_t k = (qui == "RAIL") ? 0 : (qui == "IMV") ? 1 : 255;
+  if(k == 255){ OUT->println("ERR: RAIL ou IMV"); return; }
+  int s5 = cmd.indexOf(' ', s4 + 1);
+  didLog[k].did  = (uint16_t)strtol(cmd.substring(s2 + 1, s3).c_str(), NULL, 16);
+  didLog[k].idx  = (uint8_t)cmd.substring(s3 + 1, s4).toInt();
+  didLog[k].gain = (s5 > 0) ? cmd.substring(s4 + 1, s5).toFloat()
+                            : cmd.substring(s4 + 1).toFloat();
+  didLog[k].off  = (s5 > 0) ? cmd.substring(s5 + 1).toFloat() : 0.0f;
+  didLog[k].on   = true;
+  logSupOk = false;
+  OUT->print("DIDMAP OK "); OUT->print(qui);
+  OUT->print(" DID "); OUT->print(didLog[k].did, HEX);
+  OUT->print(" idx "); OUT->print(didLog[k].idx);
+  OUT->print(" gain "); OUT->print(didLog[k].gain, 4);
+  OUT->print(" offset "); OUT->println(didLog[k].off, 2);
 }
 
 /* ============================================================
  * HELP? : rappel de toutes les commandes
  * ============================================================ */
 void cmdHelp(){
-  OUT->println("# --- Commandes obd_can_bridge v3.0 ---");
+  OUT->println("# --- Commandes obd_can_bridge v3.2 ---");
   OUT->println("# HELP?            cette aide");
   OUT->println("# PING?            test de vie -> PONG");
   OUT->println("# INFO?            identite ESP32 + MCP2515 + test SPI");
@@ -922,8 +1486,16 @@ void cmdHelp(){
   OUT->println("# EGR?             consigne et erreur EGR (PID 2C/2D)");
   OUT->println("# PID <m> <p>      requete libre hexa + decodage, ex: PID 01 0C");
   OUT->println("# SCAN?            tous les PIDs supportes, en clair");
-  OUT->println("# LOG ON|OFF [s]   log CSV horodate (console, def. 30s)");
-  OUT->println("# LOG?             une ligne CSV (page web)");
+  OUT->println("# LOG ON|OFF [ms]  enregistreur autonome (def. 333ms = 3 Hz)");
+  OUT->println("#                  export : http://192.168.1.1/log.csv");
+  OUT->println("# LOG STAT         etat, lignes, stockage, colonnes actives");
+  OUT->println("# LOG LAST         derniere ligne acquise");
+  OUT->println("# LOG? | LOG HEAD  releve unique | en-tete CSV");
+  OUT->println("# LOG DUMP         deversement CSV sur USB (console seule)");
+  OUT->println("# SUPPORT?         PIDs mode 01 reellement supportes");
+  OUT->println("# DID <hex4>       lecture identifiant constructeur (mode 22)");
+  OUT->println("# DIDSCAN <hex4> <n>  balayage d'identifiants (max 256)");
+  OUT->println("# DIDMAP RAIL|IMV <hex4> <idx> <gain> [offset]");
   OUT->println("# CLOCK! hh mm ss JJ MM AA   regle l'horloge du bus");
   OUT->println("# PROBE?           sonde adressage diag (11b/29b)");
   OUT->println("# SNIF ON|OFF      sniffer CAN brut (USB seulement)");
@@ -996,6 +1568,7 @@ void cmdInfo(){
  * ============================================================ */
 void execCmd(const String &cmd, bool fromWeb){
   if(!cmd.length()) return;
+  cmdWeb = fromWeb;
   if(cmd == "HELP?" || cmd == "HELP") cmdHelp();
   else if(cmd == "PING?")        OUT->println("PONG v1.0");
   else if(cmd == "INFO?")        cmdInfo();
@@ -1012,6 +1585,10 @@ void execCmd(const String &cmd, bool fromWeb){
   else if(cmd == "SCAN?")        cmdScan();
   else if(cmd.startsWith("CLOCK!")) cmdClock(cmd);
   else if(cmd.startsWith("LOG"))    cmdLog(cmd);
+  else if(cmd == "SUPPORT?")     cmdSupport();
+  else if(cmd.startsWith("DIDMAP"))  cmdDidMap(cmd);
+  else if(cmd.startsWith("DIDSCAN")) cmdDidScan(cmd);
+  else if(cmd.startsWith("DID "))    cmdDid(cmd);
   else if(cmd.startsWith("PID ")) cmdPid(cmd);
   else if(cmd == "SNIF ON"){
     if(fromWeb){ OUT->println("ERR USB SEULEMENT"); return; }
@@ -1059,8 +1636,11 @@ const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html>
  <button onclick="cmd('INFO?')">Infos cartes</button>
  <button id="bClear" onclick="doClear()">EFFACER d&eacute;fauts</button>
  <button onclick="cmd('SCAN?')">Scan complet</button>
- <button id="bLog" onclick="toggleLog()">Log conduite</button>
+ <button id="bLog" onclick="toggleLog()">Demarrer le log</button>
  <button onclick="dlLog()">T&eacute;l&eacute;charger CSV</button>
+ <button onclick="setHz()">Cadence log</button>
+ <button onclick="cmd('LOG STAT')">&Eacute;tat du log</button>
+ <button onclick="cmd('SUPPORT?')">PID support&eacute;s</button>
  <button onclick="setClock()">R&eacute;gler l'horloge</button>
  <button onclick="cmd('HELP?')">Aide</button>
 </div>
@@ -1098,36 +1678,37 @@ function doClear(){
  if(confirm('Effacer tous les defauts et le voyant ?\nIrreversible : note les codes avant.'))
   cmd('CLEAR!');
 }
-let logTimer=null, logCSV='';
+let logOn=false, LOG_MS=333;
 async function raw(c){
  const r=await fetch('/cmd?c='+encodeURIComponent(c));
  return await r.text();
 }
-async function toggleLog(){
+function majBtn(){
  const b=document.getElementById('bLog');
- if(logTimer){
-  clearInterval(logTimer); logTimer=null;
-  b.textContent='Log conduite'; b.style.background='';
-  add('# log arrete ('+(logCSV.split('\n').length-1)+' lignes)');
+ b.textContent=logOn?'ARRETER le log':'Demarrer le log';
+ b.style.background=logOn?'#2a8f4a':'';
+}
+async function toggleLog(){
+ if(logOn){
+  add(( await raw('LOG OFF')).trim());
+  logOn=false; majBtn();
   return;
  }
- logCSV=(await raw('LOG HEAD')).trim()+'\n';
- b.textContent='Log EN COURS'; b.style.background='#2a8f4a';
- add('# log demarre (releve toutes les 30s)');
- const tick=async()=>{
-  const l=(await raw('LOG?')).trim();
-  if(l){ logCSV+=l+'\n'; add(l); }
- };
- await tick();
- logTimer=setInterval(tick,30000);
+ add((await raw('LOG ON '+LOG_MS)).trim());
+ logOn=true; majBtn();
+ add('# enregistrement autonome : tu peux verrouiller le telephone,');
+ add('# fermer cette page ou couper le WiFi, le module continue.');
+ add('# au retour : bouton Telecharger CSV.');
 }
-function dlLog(){
- if(!logCSV){ add('# aucun log a telecharger'); return; }
- const a=document.createElement('a');
- a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(logCSV);
- a.download='log_nemo_'+Date.now()+'.csv';
- a.click();
+function setHz(){
+ const v=prompt("Periode d echantillonnage en ms (100 = 10 Hz, 333 = 3 Hz)",LOG_MS);
+ if(!v) return;
+ const n=parseInt(v,10);
+ if(isNaN(n)||n<100){ add('# valeur refusee (mini 100 ms)'); return; }
+ LOG_MS=n;
+ add('# cadence reglee sur '+LOG_MS+' ms ('+(1000/LOG_MS).toFixed(1)+' Hz)');
 }
+function dlLog(){ window.location.href='/log.csv'; }
 function setClock(){
  const d=new Date();
  const p=n=>String(n).padStart(2,'0');
@@ -1138,6 +1719,35 @@ function setClock(){
 </script></body></html>)HTML";
 
 void handleRoot(){ server.send_P(200, "text/html", PAGE); }
+
+/* Telechargement direct du releve : http://192.168.1.1/log.csv
+ * Aucune accumulation cote telephone : tout vient du module.    */
+void handleLogCsv(){
+  server.sendHeader("Content-Disposition",
+                    "attachment; filename=log_nemo.csv");
+  if(logFs){
+    if(logFile) logFile.flush();
+    File f = LittleFS.open(LOG_FICH, "r");
+    if(!f){ server.send(200, "text/csv", "horodatage\r\n"); return; }
+    server.streamFile(f, "text/csv");
+    f.close();
+    return;
+  }
+  /* repli tampon RAM : envoi par blocs, sans construire tout le CSV */
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  char buf[320];
+  String bloc;
+  logHeaderText(buf, sizeof(buf));
+  bloc = String(buf) + "\r\n";
+  for(uint16_t k=0;k<logCount;k++){
+    logRowText(logBufMs[k], logBuf[k], buf, sizeof(buf));
+    bloc += buf; bloc += "\r\n";
+    if(bloc.length() > 2000){ server.sendContent(bloc); bloc = ""; }
+  }
+  if(bloc.length()) server.sendContent(bloc);
+  server.sendContent("");
+}
 
 void handleCmd(){
   String c = server.arg("c");
@@ -1158,7 +1768,7 @@ void setup(){
   Serial.begin(115200);
   delay(300);   /* laisse le temps a l'USB CDC/moniteur de s'attacher */
 
-  Serial.println("# obd_can_bridge v2.0 - Eric Perret F1OCM");
+  Serial.println("# obd_can_bridge v3.2 - Eric Perret F1OCM");
   Serial.println("# Nemo 1.3 HDi - Marelli MJD 8F3.F6");
 
   SPI.begin();
@@ -1178,6 +1788,7 @@ void setup(){
   WiFi.softAP(AP_SSID, AP_PASS);
   server.on("/", handleRoot);
   server.on("/cmd", handleCmd);
+  server.on("/log.csv", handleLogCsv);
   server.begin();
   Serial.print("# WiFi AP "); Serial.print(AP_SSID);
   Serial.print(" (mdp "); Serial.print(AP_PASS);
@@ -1228,11 +1839,12 @@ void loop(){
     }
   }
 
-  /* mode log console : une ligne CSV toutes les logPeriod ms    */
-  if(logMode && millis() >= logNext){
-    logNext = millis() + logPeriod;
-    OUT = &Serial;
-    logLine();
+  /* acquisition log : un echantillon toutes les logPeriod ms    */
+  if(logMode && (int32_t)(millis() - logNext) >= 0){
+    logNext += logPeriod;
+    logTick();
+    /* si le cycle deborde la periode, on repart de maintenant   */
+    if((int32_t)(millis() - logNext) > 0) logNext = millis() + logPeriod;
   }
 
   /* lecture commande serie                                     */
