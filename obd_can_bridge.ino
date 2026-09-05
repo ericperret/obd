@@ -238,7 +238,7 @@
 #include <FS.h>
 #include <LittleFS.h>
 
-#define FW_VER "6.2"
+#define FW_VER "6.3"
 
 /* ---------- WiFi point d'acces ------------------------------ */
 #define AP_SSID   "NEMO-OBD"
@@ -493,15 +493,36 @@ uint8_t  brutEnCours = 0xFF;
 uint32_t brutVal = 0;
 bool     brutOk  = false;
 
-/* Ordonnanceur d'acquisition : une PID par requete, une reponse ou
- * un timeout avant la suivante. */
-#define ACQ_WAIT_MS 150UL
+/* Ordonnanceur d'acquisition : les requetes sont emises
+ * sequentiellement, mais les reponses sont totalement asynchrones.
+ * Une reponse positive est identifiee par son PID et reste valide
+ * meme si elle arrive longtemps apres l'emission.
+ *
+ * Il n'existe donc PAS de timeout de validite d'une reponse.
+ * ACQ_GAP_MS ne sert qu'a espacer les emissions pour laisser au
+ * MCP2515 et au calculateur une respiration sur le bus. Plusieurs
+ * requetes peuvent naturellement etre en vol lorsque l'ECU repond
+ * tardivement ; le PID present dans chaque reponse permet de les
+ * associer sans ambiguite. */
+#define ACQ_GAP_MS 20UL
 uint8_t  acqSlot = 0;
-bool     acqPending = false;
-uint8_t  acqPidPending = 0xFF;
-uint32_t acqDeadline = 0;
-uint32_t acqRspSeq = 0;
-uint32_t acqRspAtSend = 0;
+uint32_t acqNextSend = 0;
+uint32_t acqLastSend[256];
+uint32_t acqRxCount[256];
+uint8_t  acqLastSrc[256];
+uint8_t  acqLastAgePid = 0xFF;
+uint32_t acqLateRsp = 0;
+uint32_t acqRspTotal = 0;
+uint32_t acqRspLastMs = 0;
+uint32_t nNrc78 = 0;
+uint32_t nNrc21 = 0;
+uint32_t nNrcOther = 0;
+uint8_t  lastNrcService = 0;
+uint8_t  lastNrc = 0;
+uint8_t  rspAdr = 0;
+float    rpmRef = 0;
+uint8_t  rpmStable = 0;
+uint32_t rpmLastSeen = 0;
 
 static bool brutConnue(uint8_t p){
   for(uint8_t i=0;i<NCOL;i++) if(COL[i].pid == p) return true;
@@ -521,21 +542,33 @@ static void brutAjoute(uint8_t p){
  * ============================================================ */
 
 static void cellPut(uint8_t pid, const uint8_t *v, uint8_t n){
+  uint32_t now = millis();
+
+  /* Une reponse tardive reste une reponse valide. Si une requete
+     plus recente du meme PID a deja ete emise, on la comptabilise
+     comme tardive, mais on NE LA JETTE PAS. */
+  if(acqLastSend[pid] && (int32_t)(now - acqLastSend[pid]) >= 0){
+    if(acqLastSend[pid] != acqRspLastMs && (now - acqLastSend[pid]) > ACQ_GAP_MS)
+      acqLateRsp++;
+  }
+  acqRxCount[pid]++;
+  acqLastSrc[pid] = rspAdr;
+  acqRspTotal++;
+  acqRspLastMs = now;
 
   if(pid == brutEnCours){                    /* colonne de tourniquet */
-    uint32_t x = 0;
-    for(uint8_t i=0;i<n && i<4;i++) x = (x << 8) | v[i];
-    brutVal = x; brutOk = true;
+    uint32_t raw = 0;
+    for(uint8_t i=0;i<n && i<4;i++) raw = (raw << 8) | v[i];
+    brutVal = raw; brutOk = true;
   }
 
   float x;
   if(!pidDecode(pid, v, n, &x)) return;
-  if(acqPending && pid == acqPidPending) acqRspSeq++;
   if(pid == 0x0C) regimeNow = x;
   for(uint8_t i=0;i<NCOL;i++){
     if(COL[i].pid != pid) continue;
     cellVal[i]  = x;
-    cellMs[i]   = millis();
+    cellMs[i]   = now;
     cellShow[i] = x;
     cellSeen[i] = true;
   }
@@ -601,7 +634,6 @@ bool     scanNeg   = false;       /* 7F recu depuis la derniere emission */
 bool     scanFini  = false;       /* toutes les adresses balayees  */
 uint8_t  adrPid    = 0;           /* adresse interrogee (etape 0)  */
 bool     adrRep    = false;       /* cette adresse a repondu       */
-uint8_t  rspAdr    = 0;           /* source de la derniere trame   */
 
 static void scanRaz(){
   memset(scanLen, 0, sizeof(scanLen));
@@ -618,8 +650,17 @@ static void rspTraite(const uint8_t *b, uint16_t n){
   if(b[0] == 0x7F){
     nNeg++;
     if(scanActif) scanNeg = true;
-    else if(n >= 3 && acqPending && b[2] == acqPidPending)
-      acqRspSeq++;
+    if(n >= 3){
+      lastNrcService = b[1];
+      lastNrc = b[2];
+      if(lastNrc == 0x78) nNrc78++;
+      else if(lastNrc == 0x21) nNrc21++;
+      else nNrcOther++;
+      /* Une reponse negative ne porte pas la PID demandee. Avec des
+         reponses pouvant arriver en retard, il serait faux de l'associer
+         artificiellement a la derniere requete emise. On journalise donc
+         le service et le NRC comme evenement protocolaire independant. */
+    }
     return;
   }
   if(b[0] != 0x41 || n < 2) return;
@@ -694,7 +735,7 @@ void canPump(){
 }
 
 /* ============================================================
- * Emission des requetes - aucune attente
+ * Emission des requetes - aucune attente bloquante
  * Modes 01 et 22 en lecture seule. Jamais 2E, jamais 31.
  * ============================================================ */
 
@@ -703,13 +744,12 @@ static void askOne(uint8_t pid, uint32_t addr){
   if(canSend29(addr, f, 8)) nTx++;
 }
 
-/* Acquisition : UNE PID par requete.
- * On attend la reponse (ou un timeout court) avant d'envoyer la
- * suivante. Cela rend le debit deterministe et evite de dependre
- * d'une capacite constructeur a accepter une requete groupee.
- *
- * Les 5 PID nommees passent en priorite. Une PID brute est injectee
- * ensuite, puis le cycle recommence. */
+/* Acquisition : UNE PID par requete, emissions espacees.
+ * Il n'y a aucun timeout qui invalide une reponse. Les reponses sont
+ * traitees par canPump() au fil de leur arrivee et identifiees par
+ * le PID contenu dans le message 41 xx. Les 5 PID nommees passent
+ * en priorite ; une PID brute est injectee ensuite, puis le cycle
+ * recommence. */
 static void acqSendNext(){
   uint8_t pid = 0xFF;
   bool isRaw = false;
@@ -736,31 +776,21 @@ static void acqSendNext(){
   }
 
   uint8_t f[8] = {0x02, 0x01, pid, 0,0,0,0,0};
-  if(canSend29(ID29_FUNC, f, 8)){
+  if(canSend29(ID29_PHYS, f, 8)){
     nTx++;
-    acqPidPending = pid;
-    acqPending = true;
-    acqRspAtSend = acqRspSeq;
-    acqDeadline = millis() + ACQ_WAIT_MS;
+    acqLastSend[pid] = millis();
+    acqLastAgePid = pid;
   }
 }
 
 static void acqTick(){
-  if(!acqPending){
-    acqSendNext();
-    return;
-  }
-
-  if(acqRspSeq != acqRspAtSend){
-    acqPending = false;
-    acqSendNext();
-    return;
-  }
-
-  if((int32_t)(millis() - acqDeadline) >= 0){
-    acqPending = false;
-    acqSendNext();
-  }
+  /* Aucun timeout de reponse ici. Le CAN reste toujours capable de
+     recevoir et de traiter une reponse tardive dans canPump().
+     L'horloge ne cadence que les emissions. */
+  uint32_t now = millis();
+  if((int32_t)(now - acqNextSend) < 0) return;
+  acqSendNext();
+  acqNextSend = now + ACQ_GAP_MS;
 }
 
 /* ============================================================
@@ -1144,7 +1174,7 @@ static void scanDebut(Phase ph, const char *quoi){
 }
 
 /* ============================================================
- * Phase 5 : acquisition, un tick par seconde
+ * Phase 5 : acquisition asynchrone, donnees par PID
  * ============================================================ */
 void logTickAcq(){
   char ts[32];
@@ -1201,9 +1231,17 @@ void logStart(bool reprise){
   for(uint8_t i=0;i<NCOL;i++){ cellMs[i] = 0; cellSeen[i] = false; }
   brutOk = false; brutEnCours = 0xFF;
   acqSlot = 0;
-  acqPending = false;
-  acqPidPending = 0xFF;
-  acqRspAtSend = acqRspSeq;
+  acqNextSend = millis();
+  memset(acqLastSend, 0, sizeof(acqLastSend));
+  memset(acqRxCount, 0, sizeof(acqRxCount));
+  memset(acqLastSrc, 0, sizeof(acqLastSrc));
+  acqLastAgePid = 0xFF;
+  acqLateRsp = 0;
+  acqRspTotal = 0;
+  acqRspLastMs = 0;
+  rpmRef = 0;
+  rpmStable = 0;
+  rpmLastSeen = 0;
 
   Phase repris = reprise ? flagLoad() : PH_IDLE;
   char l[80];
@@ -1260,6 +1298,7 @@ static void downloadDone(){
   ESP.restart();
 }
 
+
 /* ============================================================
  * Machine d'etat de session - appelee a chaque tour de loop()
  * ============================================================ */
@@ -1275,7 +1314,31 @@ void sessionTick(){
 
     case PH_ATTENTE: {
       static uint32_t tR = 0;
-      if(regimeNow > 300){
+
+      /* Le demarrage n'est valide qu'apres plusieurs mesures RPM
+         coherentes. Une simple valeur >300 tr/min peut etre un artefact
+         de demarrage ou une reponse ancienne. */
+      if(cellSeen[0] && cellMs[0] != rpmLastSeen){
+        rpmLastSeen = cellMs[0];
+        float r = regimeNow;
+        if(r > 300){
+          if(rpmStable == 0) rpmRef = r;
+          float tol = rpmRef * 0.08f;
+          if(tol < 80.0f) tol = 80.0f;
+          if(fabsf(r - rpmRef) <= tol){
+            if(rpmStable < 10) rpmStable++;
+          }else{
+            rpmStable = 0;
+            rpmRef = r;
+          }
+        }else{
+          rpmStable = 0;
+          rpmRef = 0;
+        }
+      }
+
+      if(rpmStable >= 4){
+        rpmStable = 0;
         scanDebut(PH_SCAN_RUN, "SCAN RUN");
       }else if((int32_t)(now - tR) >= 0){
         tR = now + 250;
@@ -1893,7 +1956,7 @@ const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="fr"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NEMO-OBD</title><style>
 *{box-sizing:border-box}body{margin:0;padding:10px;background:#111;color:#ddd;font:15px/1.3 system-ui,sans-serif}
-h1{font-size:18px;margin:0 0 7px;color:#7cf}#v{float:right;font-size:11px;color:#777;font-weight:400}
+h1{font-size:18px;margin:0 0 7px;color:#7cf}.rel{font-size:11px;color:#777;font-weight:400;margin-left:6px}
 #status{background:#1a2632;border:1px solid #2d4356;border-radius:7px;padding:8px 10px;margin-bottom:8px;font-weight:600;color:#7cf;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .g{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:8px}.c{background:#1c1c1c;border:1px solid #333;border-radius:8px;padding:8px}
 .c:last-child{grid-column:1/-1}.n{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.4px}.c .v{font-size:25px;font-weight:650;color:#7cf;margin-top:1px}
@@ -1906,7 +1969,7 @@ button{font:14px system-ui;padding:11px 5px;border:0;border-radius:7px;backgroun
 .off{background:#5c1e1e;color:#fcc}.on{background:#1e5c2e;color:#cfc}.dgr{background:#3a2020;color:#e99}.dgr.armed{background:#a01e1e;color:#fff;font-weight:700}
 #s{font:11px ui-monospace,monospace;color:#8a8;white-space:pre-wrap;background:#161616;border:1px solid #2a2a2a;border-radius:6px;padding:6px;min-height:24px}
 </style></head><body>
-<h1>NEMO-OBD<span id="v"></span></h1>
+<h1>NEMO-OBD <span class="rel">V6.3 — 05 SEP 2026</span></h1>
 <div id="status">PRET - appuyez sur START LOG</div>
 <div class="g" id="g"></div>
 <div id="fl"><div id="fll"><span>JOURNAL EN FLASH</span><span id="fln">--</span></div><div id="fb"><div id="fbin"></div></div></div>
@@ -1932,7 +1995,7 @@ b.textContent="EFFACER ?";b.classList.add("armed");pb=setTimeout(function(){pb=n
 var eb=null;function eff(){var b=document.querySelector(".dgr");if(eb){clearTimeout(eb);eb=null;b.textContent="RESET DEFAUTS";b.classList.remove("armed");document.getElementById("s").textContent="sequence en cours...";cmd("RESET!");return}
 b.textContent="CONFIRMER ?";b.classList.add("armed");eb=setTimeout(function(){eb=null;b.textContent="RESET DEFAUTS";b.classList.remove("armed")},4000)}
 function maj(){fetch("/stat",{cache:"no-store"}).then(function(r){return r.json()}).then(function(j){
-document.getElementById("v").textContent="v"+j.fw+"  "+j.n+" lignes";document.getElementById("status").textContent=j.status;
+document.getElementById("status").textContent=j.status;
 var fp=j.tot?(j.use*100/j.tot):0,fi=document.getElementById("fbin");fi.style.width=fp.toFixed(1)+"%";fi.className=(fp>=90)?"hot":((fp>=70)?"mid":"");
 document.getElementById("fln").textContent=(j.use/1024).toFixed(1)+" ko / "+(j.tot/1024).toFixed(0)+" ko ("+fp.toFixed(1)+"%) — "+j.n+" lignes"+(j.plein?" — PLEINE":"");
 for(var i=0;i<NOM.length;i++){var c=document.getElementById("c"+i),v=j.val[i],x=c.querySelector(".v"),gi=c.querySelector(".gi");x.textContent=(v===null)?"--":v;c.className="c"+(j.frais[i]?"":" old");gi.style.width=(v===null||!MAX[i])?"0%":Math.min(100,Math.max(0,Math.abs(v)*100/MAX[i]))+"%";}
@@ -1974,6 +2037,11 @@ void handleStat(){
   j += ",\"rsp\":";      j += nRsp;
   j += ",\"drop\":";     j += nDrop;
   j += ",\"neg\":";      j += nNeg;
+  j += ",\"nrc78\":";    j += nNrc78;
+  j += ",\"nrc21\":";    j += nNrc21;
+  j += ",\"nrcOther\":"; j += nNrcOther;
+  j += ",\"late\":";     j += acqLateRsp;
+  j += ",\"rspa\":";     j += acqRspTotal;
   j += ",\"eflg\":";     j += mcpOk ? mcpRead(R_EFLG) : 0;
   j += ",\"txctrl\":";   j += mcpOk ? mcpRead(R_TXB0CTRL) : 0;
   j += ",\"cadence_ms\":"; j += LOG_PERIOD_MS;
