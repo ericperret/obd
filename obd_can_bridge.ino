@@ -7,7 +7,7 @@
 #include <FS.h>
 #include <LittleFS.h>
 
-#define FW_VER "8.4"
+#define FW_VER "8.11"
 
 /* ---------- WiFi point d'acces ------------------------------ */
 #define AP_SSID   "NEMO-OBD"
@@ -238,6 +238,79 @@ const PidDef PIDTABLE[] = {
 };
 #define NPID (sizeof(PIDTABLE)/sizeof(PIDTABLE[0]))
 
+/* ---------- Niveau 2 : PID 0x1C (norme OBD, table plate) ------ */
+struct NormeObd { uint8_t val; const char* nom; };
+const NormeObd NORMES_OBD[] = {
+  {1,"OBD II (Californie ARB)"},{2,"OBD (EPA federal)"},{3,"OBD et OBD II"},{4,"OBD I"},
+  {5,"Non conforme OBD"},{6,"EOBD"},{7,"EOBD et OBD II"},{8,"EOBD et OBD"},
+  {9,"EOBD, OBD, OBD II"},{10,"JOBD"},{11,"JOBD et OBD II"},{12,"JOBD et EOBD"},
+  {13,"JOBD, EOBD, OBD II"},{14,"Poids lourds (Euro IV) B1"},{15,"Poids lourds (Euro V) B2"},
+  {16,"Poids lourds (Euro EEC) C"},{17,"Diagnostic constructeur (EMD)"},{18,"Diagnostic constructeur ameliore (EMD+)"},
+  {19,"HD OBD partiel"},{20,"HD OBD"},{21,"WWH OBD"},{23,"HD EOBD-I sans NOx"},
+  {24,"HD EOBD-I avec NOx"},{25,"HD EOBD-II sans NOx"},{26,"HD EOBD-II avec NOx"},
+  {27,"Poids lourds ZEV"},{28,"Bresil OBD Phase 1"},{29,"Bresil OBD Phase 2/2+"},
+  {30,"OBD coreen"},{31,"Inde BS4 OBD I"},{32,"Inde BS4 OBD II"},{33,"Euro VI"},
+  {34,"OBD, OBD II et HD OBD"},{35,"Bresil OBD Phase 3"},{36,"Moto Euro OBD-I"},
+  {37,"Moto Euro OBD-II"},{38,"Moto Chine OBD-I"},{39,"Moto Taiwan OBD-I"},{40,"Moto Japon OBD-I"},
+  {41,"Chine niveau national Stage 6"},{42,"Bresil OBD Phase 7"},{43,"Chine poids lourds VI"},
+  {44,"Inde BS6 OBD I"},{45,"Inde BS6 OBD II"},{46,"Inde BSVI poids lourds"},{47,"Bresil OBD Phase 8"},
+  {48,"Japon poids lourds OBD-II"},{49,"Coree poids lourds OBD-II"},{50,"Chine tout-terrain IV OBD"},
+  {51,"ZEV leger ACC-II"},{52,"Moto Japon OBD-II"},{53,"Moto Californie CARB OBD"},
+  {54,"Moto federal EPA OBD"},{55,"Moto 50-Etats CARB+EPA OBD"},{56,"Poids lourds ZEV CARB ZEP"},
+  {57,"ZEV leger CARB ACC-II + EPA Tier4"},{58,"ZEV leger EPA Tier4"},{59,"EPA poids lourds"}
+};
+#define NNORMES (sizeof(NORMES_OBD)/sizeof(NORMES_OBD[0]))
+
+String decodeNorme1C(uint8_t v) {
+  for (uint16_t i = 0; i < NNORMES; i++) if (NORMES_OBD[i].val == v) return String(NORMES_OBD[i].nom);
+  return "Valeur inconnue (" + String(v) + ")";
+}
+
+/* ---------- Niveau 2 : PID 0x01/0x41 (statut moniteurs, bits) --
+ * Octet A : A7=MIL, A6-A0=nb codes (uniquement PID 01, A=0 sur PID 41)
+ * Octet B : B0=rates supporte, B1=carburant supporte, B2=composants supporte,
+ *           B3=type allumage (0=essence,1=diesel), B4/B5/B6=NON termine (rates/carburant/composants)
+ * Octet C : bit=1 -> moniteur supporte (C0..C7 ci-dessous)
+ * Octet D : memes positions que C, bit=1 -> NON termine ce cycle
+ * (verifie sur donnees reelles du vehicule ; le sens "1=non termine" est
+ * contre-intuitif mais confirme par plusieurs sources croisees) */
+struct MoniteurNC { uint8_t bit; const char* nom; };
+const MoniteurNC MONITEURS_NC[] = {
+  {0,"Catalyseur"},{1,"Catalyseur chauffe"},{2,"Systeme evaporatif"},{3,"Air secondaire"},
+  {4,"Climatisation (refrigerant)"},{5,"Sonde O2"},{6,"Rechauffage sonde O2"},{7,"EGR"}
+};
+const char* MONITEURS_CONT[] = {"Rates d'allumage", "Systeme carburant", "Composants divers"};
+
+String decodeStatutMoniteurs(uint8_t* data, bool cyclActuel) {
+  uint8_t A = data[3], B = data[4], C = data[5], D = data[6];
+  String out = "";
+  if (!cyclActuel) {
+    out += (A & 0x80) ? "MIL:ON, " : "MIL:off, ";
+    out += String(A & 0x7F) + " code(s), ";
+  }
+  out += (B & 0x08) ? "diesel" : "essence";
+  out += " | ";
+  bool premier = true;
+  const char* ok = cyclActuel ? "termine" : "pret";
+  const char* non = cyclActuel ? "en cours" : "pas pret";
+  for (uint8_t i = 0; i < 3; i++) {
+    if (B & (1 << i)) {
+      if (!premier) out += ", ";
+      out += String(MONITEURS_CONT[i]) + ":" + ((B & (1 << (i + 4))) ? non : ok);
+      premier = false;
+    }
+  }
+  for (uint8_t i = 0; i < 8; i++) {
+    if (C & (1 << MONITEURS_NC[i].bit)) {
+      if (!premier) out += ", ";
+      out += String(MONITEURS_NC[i].nom) + ":" + ((D & (1 << MONITEURS_NC[i].bit)) ? non : ok);
+      premier = false;
+    }
+  }
+  if (premier) out += "aucun moniteur supporte";
+  return out;
+}
+
 String decodePid(uint8_t pid, uint8_t* data, uint8_t len) {
   String out = "";
   bool found = false;
@@ -306,6 +379,42 @@ bool    derniereOk[NB_MONITOR];
 String  derniereVal[NB_MONITOR];   // texte decode, pour les jauges
 float   derniereNum[NB_MONITOR];   // valeur numerique, pour les jauges
 File    logFile;
+
+/* ---------- Niveau 2 : etat -------------------------------------------- */
+String   normeObd = "-";           // 0x1C, interroge une seule fois au demarrage
+String   statutMoniteursDepuis = "-";  // 0x01, toutes les 60 s
+String   statutMoniteursCycle = "-";   // 0x41, toutes les 60 s
+uint32_t derniereMajNiveau2 = 0;
+#define NIVEAU2_INTERVAL_MS 60000UL
+
+void listerFlash() {
+  Serial.println("[DBG] --- Contenu LittleFS ---");
+  File root = LittleFS.open("/");
+  File f = root.openNextFile();
+  size_t total = 0;
+  uint16_t nb = 0;
+  while (f) {
+    Serial.printf("[DBG]   %-30s %8u octets\n", f.name(), (unsigned)f.size());
+    total += f.size();
+    nb++;
+    f = root.openNextFile();
+  }
+  root.close();
+  Serial.printf("[DBG] --- %u fichier(s), %u octets au total (usedBytes=%u, totalBytes=%u) ---\n",
+                nb, (unsigned)total, (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+}
+
+void verifierNiveau2() {
+  if (millis() - derniereMajNiveau2 < NIVEAU2_INTERVAL_MS && derniereMajNiveau2 != 0) return;
+  uint32_t respId; uint8_t data[8]; uint8_t len; uint8_t buf;
+  if (testerUnPid(0x01, respId, data, len, buf) && len >= 7 && data[1] == 0x41) {
+    statutMoniteursDepuis = decodeStatutMoniteurs(data, false);
+  }
+  if (testerUnPid(0x41, respId, data, len, buf) && len >= 7 && data[1] == 0x41) {
+    statutMoniteursCycle = decodeStatutMoniteurs(data, true);
+  }
+  derniereMajNiveau2 = millis();
+}
 String  logBuffer;             // tampon RAM, ecrit sur flash par lots (pas a chaque ligne)
 uint32_t derniereEcritureMs = 0;
 #define FLUSH_INTERVAL_MS 5000UL   // ecriture flash au plus toutes les 5 s
@@ -348,13 +457,72 @@ bool testerUnPid(uint8_t pid, uint32_t &respIdOut, uint8_t* dataOut, uint8_t &le
   return got;
 }
 
+/* ---------- Requete "mode seul", sans octet PID (03/04/07/0A) - meme patron que testerUnPid */
+bool testerMode(uint8_t sid, uint32_t &respIdOut, uint8_t* dataOut, uint8_t &lenOut, uint8_t &bufOut) {
+  uint32_t d_id; uint8_t d_data[8]; uint8_t d_len; uint8_t d_buf;
+  uint16_t drainCount = 0;
+  while (mcp_recv(d_id, d_data, d_len, d_buf)) {
+    drainCount++;
+    if (drainCount > 100) {
+      Serial.println("[DBG] !! vidage buffers > 100 iterations (mode)");
+      break;
+    }
+    yield();
+  }
+
+  const uint8_t req_data[8] = {0x01, sid, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
+  mcp_send_ext(BROADCAST_ID, req_data, 8);
+
+  unsigned long t_start = millis();
+  bool got = false;
+  while (millis() - t_start < PID_TIMEOUT_MS) {
+    uint32_t rx_id; uint8_t rx_data[8]; uint8_t rx_len; uint8_t rx_buf;
+    if (!got && mcp_recv(rx_id, rx_data, rx_len, rx_buf)) {
+      if (rx_id == RESP_ID) {
+        respIdOut = rx_id;
+        lenOut = rx_len;
+        memcpy(dataOut, rx_data, rx_len);
+        bufOut = rx_buf;
+        got = true;
+      }
+    }
+    server.handleClient();
+    yield();
+  }
+  return got;
+}
+
+/* ---------- Decodage DTC (P/C/B/U + 4 chiffres) --------------- */
+String decodeDTC(uint8_t b1, uint8_t b2) {
+  if (b1 == 0 && b2 == 0) return "";   // bourrage / absence de code
+  const char lettres[] = {'P', 'C', 'B', 'U'};
+  char lettre = lettres[(b1 >> 6) & 0x03];
+  uint8_t d1 = (b1 >> 4) & 0x03;
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%c%d%X%02X", lettre, d1, b1 & 0x0F, b2);
+  return String(buf);
+}
+
+// Un seul frame simple = SID + 6 octets max = 3 DTC max (au-dela : multi-trame ISO-TP, non gere)
+String listerDTC(uint8_t* data, uint8_t len) {
+  uint8_t pciLen = data[0] & 0x0F;   // SID + octets DTC utiles, independant du bourrage a 8
+  if (pciLen <= 1) return "Aucun";
+  uint8_t nbCodes = (pciLen - 1) / 2;
+  String out = "";
+  for (uint8_t i = 0; i < nbCodes; i++) {
+    String code = decodeDTC(data[2 + i * 2], data[3 + i * 2]);
+    if (code.length()) { if (out.length()) out += ", "; out += code; }
+  }
+  return out.length() ? out : "Aucun";
+}
+
 /* ---------- HTML Principal ---------------------------------- */
 const char* HTML_INDEX = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>NEMO OBD - FW 8.4</title>
+  <title>NEMO OBD - FW 8.11</title>
   <style>
     body { font-family: Arial, sans-serif; text-align: center; background: #000; color: #fff; padding: 20px; }
     h1, h2 { color: #fff; }
@@ -379,16 +547,32 @@ const char* HTML_INDEX = R"rawliteral(
   <button id="btnLog" onclick="toggleLog()">LOG</button>
   <div id="logStatus">Arrete</div>
   <a id="downloadLog" href="/download_log" download="drivelog.csv">Telecharger log CSV</a>
-  <button id="btnPurge" onclick="purgerLog()" style="background:#c0392b;">PURGER LOG</button>
+  <button id="btnPurge" onclick="purgerLog()" style="background:#c0392b;">PURGER (log + scan)</button>
   <div id="fsBarWrap" style="width:95%;max-width:760px;margin:12px auto;background:#333;border-radius:6px;overflow:hidden;height:22px;">
     <div id="fsBar" style="height:100%;width:0%;background:#2ecc71;transition:width 0.3s;"></div>
   </div>
   <div id="fsText" style="margin-bottom:10px;color:#ccc;">-- </div>
   <div id="jauges" class="jauge-grid"></div>
 
+  <div style="width:95%;max-width:760px;margin:16px auto 0;text-align:left;font-size:14px;color:#ccc;line-height:1.6;">
+    <div>Norme OBD : <span id="n1c" style="color:#fff;">--</span></div>
+    <div>Moniteurs depuis effacement : <span id="n01" style="color:#fff;">--</span></div>
+    <div>Moniteurs cycle actuel : <span id="n41" style="color:#fff;">--</span></div>
+  </div>
+
+  <h2>Defauts</h2>
+  <button id="btnCheckDtc" onclick="checkDtc()">CHECK DEFAUTS</button>
+  <button id="btnClearDtc" onclick="clearDtc()" style="background:#c0392b;">CLEAR DEFAUTS</button>
+  <div style="width:95%;max-width:760px;margin:12px auto 0;text-align:left;font-size:14px;color:#ccc;line-height:1.6;">
+    <div>Memorises (Mode 03) : <span id="dtc03" style="color:#fff;">--</span></div>
+    <div>En attente (Mode 07) : <span id="dtc07" style="color:#fff;">--</span></div>
+    <div>Permanents (Mode 0A) : <span id="dtc0a" style="color:#fff;">--</span></div>
+  </div>
+  <div id="clearResult" style="margin-top:8px;font-weight:bold;"></div>
+
   <hr style="border-color:#333; margin:30px 0;">
 
-  <h1>Scan PID - ECU 0x10 (Nemo C-CAN) - FW 8.4</h1>
+  <h1>Scan PID - ECU 0x10 (Nemo C-CAN) - FW 8.11</h1>
   <button id="btnCall" onclick="startCall()">CALL</button>
   <br><br>
   <button id="btnTest" onclick="testPid()">TEST PID 0x0C</button>
@@ -531,8 +715,39 @@ const char* HTML_INDEX = R"rawliteral(
       });
     }
 
+    function checkDtc() {
+      document.getElementById('dtc03').textContent = '...';
+      document.getElementById('dtc07').textContent = '...';
+      document.getElementById('dtc0a').textContent = '...';
+      fetch('/check_dtc').then(function(r) { return r.json(); }).then(function(d) {
+        document.getElementById('dtc03').textContent = d.memorises;
+        document.getElementById('dtc07').textContent = d.attente;
+        document.getElementById('dtc0a').textContent = d.permanents;
+      });
+    }
+
+    function clearDtc() {
+      if (!confirm('Effacer les defauts memorises reinitialise aussi les moniteurs de conformite (readiness) - un cycle de conduite complet sera necessaire avant un controle technique. Confirmer ?')) return;
+      var div = document.getElementById('clearResult');
+      div.textContent = '...';
+      fetch('/clear_dtc').then(function(r) { return r.json(); }).then(function(d) {
+        div.textContent = d.ok ? 'Defauts effaces.' : ('Echec : ' + d.raison);
+        if (d.ok) checkDtc();
+      });
+    }
+
+    function majNiveau2() {
+      fetch('/log_status').then(function(r) { return r.json(); }).then(function(d) {
+        document.getElementById('n1c').textContent = d.norme1c;
+        document.getElementById('n01').textContent = d.statut01;
+        document.getElementById('n41').textContent = d.statut41;
+      });
+    }
+
     initJauges();
     majJauges();
+    majNiveau2();
+    setInterval(majNiveau2, 5000);
   </script>
 </body>
 </html>
@@ -709,6 +924,7 @@ void setup() {
   Serial.begin(115200);
   Serial.printf("obd_can_bridge FW %s\n", FW_VER);
   LittleFS.begin(true);
+  listerFlash();
 
   mcp_init();
 
@@ -874,7 +1090,8 @@ void setup() {
       json += "{\"pid\":\"0x" + String(pidhex) + "\",\"ok\":" + String(derniereOk[i] ? "true" : "false") +
               ",\"num\":" + String(derniereNum[i], 2) + ",\"txt\":\"" + derniereVal[i] + "\"}";
     }
-    json += "]}";
+    json += "],\"norme1c\":\"" + normeObd + "\",\"statut01\":\"" + statutMoniteursDepuis +
+            "\",\"statut41\":\"" + statutMoniteursCycle + "\"}";
     server.send(200, "application/json", json);
   });
 
@@ -883,8 +1100,13 @@ void setup() {
       server.send(200, "application/json", "{\"ok\":false,\"raison\":\"log en cours\"}");
       return;
     }
-    bool removed = !LittleFS.exists("/drivelog.csv") || LittleFS.remove("/drivelog.csv");
-    server.send(200, "application/json", removed ? "{\"ok\":true}" : "{\"ok\":false,\"raison\":\"echec suppression\"}");
+    bool r1 = !LittleFS.exists("/drivelog.csv") || LittleFS.remove("/drivelog.csv");
+    bool r2 = !LittleFS.exists("/result.csv") || LittleFS.remove("/result.csv");
+    // Residus d'anciennes versions abandonnees (jamais crees par ce firmware) :
+    if (LittleFS.exists("/mode.txt")) LittleFS.remove("/mode.txt");
+    if (LittleFS.exists("/trace.csv")) LittleFS.remove("/trace.csv");
+    listerFlash();
+    server.send(200, "application/json", (r1 && r2) ? "{\"ok\":true}" : "{\"ok\":false,\"raison\":\"echec suppression\"}");
   });
 
   server.on("/download_log", HTTP_GET, []() {
@@ -895,7 +1117,47 @@ void setup() {
     f.close();
   });
 
+  server.on("/check_dtc", HTTP_GET, []() {
+    uint32_t respId; uint8_t data[8]; uint8_t len; uint8_t buf;
+    String m03 = "pas de reponse", m07 = "pas de reponse", m0a = "pas de reponse";
+
+    if (testerMode(0x03, respId, data, len, buf)) {
+      m03 = (data[1] == 0x43) ? listerDTC(data, len) :
+            (data[1] == 0x7F) ? ("NEG NRC " + String(data[3], HEX)) : "Brut";
+    }
+    if (testerMode(0x07, respId, data, len, buf)) {
+      m07 = (data[1] == 0x47) ? listerDTC(data, len) :
+            (data[1] == 0x7F) ? ("NEG NRC " + String(data[3], HEX)) : "Brut";
+    }
+    if (testerMode(0x0A, respId, data, len, buf)) {
+      m0a = (data[1] == 0x4A) ? listerDTC(data, len) :
+            (data[1] == 0x7F) ? ("NEG NRC " + String(data[3], HEX)) : "Brut";
+    }
+
+    String json = "{\"memorises\":\"" + m03 + "\",\"attente\":\"" + m07 + "\",\"permanents\":\"" + m0a + "\"}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/clear_dtc", HTTP_GET, []() {
+    uint32_t respId; uint8_t data[8]; uint8_t len; uint8_t buf;
+    String json;
+    if (testerMode(0x04, respId, data, len, buf)) {
+      if (data[1] == 0x44) json = "{\"ok\":true}";
+      else if (data[1] == 0x7F) json = "{\"ok\":false,\"raison\":\"NEG NRC " + String(data[3], HEX) + "\"}";
+      else json = "{\"ok\":false,\"raison\":\"reponse inattendue\"}";
+    } else {
+      json = "{\"ok\":false,\"raison\":\"pas de reponse\"}";
+    }
+    server.send(200, "application/json", json);
+  });
+
   server.begin();
+
+  // Norme OBD (0x1C) : statique, interrogee une seule fois au demarrage
+  uint32_t respId; uint8_t data[8]; uint8_t len; uint8_t buf;
+  if (testerUnPid(0x1C, respId, data, len, buf) && len >= 4 && data[1] == 0x41) {
+    normeObd = decodeNorme1C(data[3]);
+  }
 }
 
 void loop() {
@@ -908,6 +1170,7 @@ void loop() {
       logFile.close();   // fermeture differee (voir /log_stop)
       Serial.println("[DBG] fichier ferme");
     }
+    verifierNiveau2();   // pas de log en cours : profite du temps libre
     return;
   }
 
@@ -995,6 +1258,7 @@ void loop() {
         derniereEcritureMs = millis();
         Serial.printf("[DBG] ecriture flash OK (%lums)\n", millis() - tFlush);
       }
+      verifierNiveau2();   // jamais en rafale : ne pas perturber la cadence rapide
     } else {
       // Rafale : pause courte entre manches (stabilite avant vitesse), aucune
       // ecriture flash tant que la rafale dure - le tampon RAM absorbe tout.
