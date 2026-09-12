@@ -1,20 +1,22 @@
-<!-- README.md — projet obd_can_bridge Auteur : Eric (F1OCM) Date : 2026-09-05 Version doc : 1.1 (alignée firmware v6.3) -->
+<!-- README.md — projet obd_can_bridge
+     Auteur : Eric (F1OCM)
+     Aligné firmware v8.4 -->
 
 # obd_can_bridge
 
-Pont de diagnostic **OBD-II autonome sur ESP32**, avec interface web intégrée accessible en WiFi depuis un smartphone.
+Pont de diagnostic **OBD-II autonome sur ESP32-S3**, avec interface web intégrée accessible en WiFi depuis un smartphone ou un PC.
 
-Le firmware est contenu dans un **seul fichier `.ino`**, avec une page HTML/CSS/JavaScript embarquée directement dans le programme. Aucune librairie Arduino tierce n'est nécessaire.
+Le firmware est contenu dans un **seul fichier `.ino`**, page HTML/CSS/JavaScript comprise (chaîne littérale embarquée dans le programme). **Aucune bibliothèque CAN externe** : le MCP2515 est piloté en registres SPI bruts, écrits à la main d'après la datasheet Microchip.
 
 Développé et validé sur :
 
 - **Citroën Nemo 1.3 HDi**
-- moteur Fiat **199A2000 / 1.3 Multijet**
+- moteur Fiat **199A2000 / 1.3 Multijet** (PSA F13DTE5)
 - calculateur **Marelli MJD 8F3.F6**
-- CAN moteur **500 kbit/s**
+- bus C-CAN moteur, **500 kbit/s**
 - diagnostic **ISO 15765-4, adressage étendu 29 bits**
 
-**Firmware actuel : v6.3 — 05/09/2026**
+**Firmware actuel : v8.4**
 
 ## Matériel
 
@@ -24,343 +26,105 @@ Développé et validé sur :
 | CAN | Seeed CAN Bus Breakout 713-105100001 |
 | Contrôleur CAN | MCP2515, quartz 16 MHz |
 | Transceiver | SN65HVD230 |
+| CS | D7 |
+| INT | D6 (câblé, non utilisé — le firmware fonctionne en polling) |
 | Bus | CAN moteur, 500 kbit/s |
-| OBD | broche 6 CAN-H / broche 14 CAN-L |
-| SPI | MCP2515 |
 
 ## Interface WiFi
 
-Le XIAO ESP32-S3 crée son propre point d'accès WiFi :
+Le XIAO ESP32-S3 crée son propre point d'accès :
 
 - **SSID : `NEMO-OBD`**
 - **Mot de passe : `nemo1234`**
 - **IP : `192.168.1.1`**
 - interface : `http://192.168.1.1/`
 
-Aucune connexion Internet n'est nécessaire.
+Aucune connexion Internet requise, aucune ressource externe (pas de CDN, pas de dépendance JS).
 
-L'interface web est entièrement embarquée dans le firmware : aucune ressource externe, aucun CDN et aucune dépendance JavaScript.
+## Ce que la norme impose sur ce véhicule
 
-## Principe de fonctionnement
+ISO 15765-4 limite l'adressage diagnostic à deux valeurs de PDU Format :
 
-Une session de mesure suit une séquence déterministe.
+- `0x18DA<TA><SA>` — adressage physique (un ECU précis)
+- `0x18DB33<SA>` — adressage fonctionnel (broadcast, tous les ECU OBD)
 
-### 1. START LOG
+**Constat empirique sur ce véhicule** : la passerelle BSI ne route vers le bus moteur que les requêtes en adressage **fonctionnel**. L'adressage physique unicast (`0x18DA10F1`) n'obtient jamais de réponse, alors que le broadcast (`0x18DB33F1`) fonctionne systématiquement. Le firmware envoie donc **toutes** ses requêtes Mode 01 en broadcast, et filtre les réponses sur l'adresse ECU connue.
 
-Le bouton **START LOG** crée ou reprend le journal et lance le premier scan avec le moteur arrêté.
+**ECU répondant identifié** : `0x10` (moteur, Marelli MJD 8F3.F6). C'est le seul calculateur du véhicule qui répond à l'OBD générique légal — ABS/ESP, airbag, BSI sont sur un bus séparé, non câblé sur ce montage.
 
-Le firmware :
+**PID Mode 01 réellement supportés par cet ECU** : la chaîne d'index s'arrête à `0x40` (bitmap `80 C0 00 00`, dernier bit à 0) — aucun PID au-delà de `0x4A` n'est disponible en OBD générique sur ce véhicule (pas de couple moteur, pas de pression de suralimentation directe, pas de position de rapport engagé).
 
-1. inventorie les adresses diagnostiques présentes sur le bus ;
-2. recherche les PID disponibles ;
-3. enregistre le résultat du scan dans le même fichier CSV.
+## Filtrage matériel
 
-Lorsque le scan est terminé, l'interface affiche :
+Le MCP2515 est configuré avec un masque/filtre matériel qui n'accepte que les trames `0x18DAF1xx` (réponse OBD physique, quel que soit l'ECU répondant) — tout le reste du trafic bus (qui sature vite les 2 buffers de réception une fois le moteur tournant) est éliminé par le silicium avant même de remonter en SPI.
 
-> **SCAN 1 OK - DEMARREZ LE MOTEUR**
+## Fonctionnalités de la page web
 
-### 2. Démarrage du moteur
+### Log continu (jauges)
 
-Le démarrage du moteur provoque normalement le redémarrage électrique de l'ESP32.
+- 9 jauges circulaires (SVG, anneau vert sur fond noir) : **Pédale D, Pédale E, Vitesse, Régime, Charge, MAF, P admission, P rampe, EGR**.
+- Bouton **LOG** / **STOP LOG**.
+- Cadence normale : environ **1 Hz** (un cycle complet des 9 PID, calé sur la seconde).
+- Détection automatique de perte de puissance — passage en **RAFALE** (15 s, cycles enchaînés avec une pause courte de 100 ms, sans calage 1 Hz) si :
+  - pédale en hausse **et** vitesse en baisse par rapport au cycle précédent, **ou**
+  - pédale > 75 %.
+- Ordre de **lecture** CAN (fixe, pour la synchronisation) : `0x49→0x0D→0x0C→0x04→0x10→0x0B→0x23→0x2C→0x4A` — pédale et vitesse consécutives en tête de cycle, écart temporel minimal entre les deux valeurs qui déclenchent la détection.
+- Ordre d'**affichage** des jauges indépendant de l'ordre de lecture (regroupement visuel logique).
+- Journal horodaté (`t_ms` relatif au démarrage) écrit dans `/drivelog.csv` sur LittleFS.
+- Écriture flash **tamponnée en RAM**, au plus une fois toutes les **5 s**, **jamais pendant une rafale** (une écriture flash peut geler le WiFi le temps de l'opération — c'est tout le tampon qui part d'un coup au retour en mode normal).
+- Barre de remplissage LittleFS (rouge au-delà de 85 %).
+- Bouton **PURGER LOG** (supprime le journal sans passer par le téléchargement ; refusé si un log est en cours).
+- Téléchargement séparé (`/download_log`), fichier `nemo_drivelog.csv`.
 
-L'état de la session est conservé dans LittleFS afin que le firmware puisse reprendre après ce redémarrage.
+### Scan PID (découverte des PID supportés)
 
-Le firmware attend ensuite la détection du régime moteur et valide le démarrage sur plusieurs mesures cohérentes avant de lancer le second scan.
+- Bouton **CALL**.
+- Suit la chaîne d'index standard `0x00 → 0x20 → 0x40 → …` (bit de poids faible de chaque bitmap = "le groupe suivant existe"), s'arrête dès qu'un bitmap dit non ou qu'un maillon de la chaîne ne répond pas.
+- N'interroge que les PID réellement annoncés supportés par les bitmaps décodés (pas de balayage aveugle 0x00-0xFF).
+- Résultats affichés en direct (Server-Sent Events) : PID, réponse OUI/NON, buffer MCP2515 (RXB0/RXB1), données brutes, valeur décodée.
+- Résultats écrits dans `/result.csv`, téléchargeable (`/download`).
 
-### 3. SCAN RUN
+### Test PID isolé
 
-Le second scan est réalisé moteur tournant.
+- Bouton **TEST PID 0x0C** — sonde un seul PID fixe (`TEST_PID`, modifiable dans le code), pour vérifier rapidement la liaison sans lancer un scan complet.
 
-À la fin :
+## Décodage Mode 01
 
-> **SCAN 2 OK - LOG EN COURS**
+Table de correspondance (~155 entrées) couvrant les PID Mode 01 à formule linéaire simple (`valeur = mul × brut + add`, sur 1, 2 ou 4 octets, signé ou non, à un décalage donné dans la trame — gère aussi les PID à plusieurs valeurs comme `0x66` ou `0x9A`). Formules sourcées SAE J1979 / Wikipédia.
 
-L'acquisition commence immédiatement.
+**Non décodés (affichés en "Brut")** : les PID à champs encodés bit à bit avec table de correspondance énumérée — `0x00, 0x01, 0x03, 0x12, 0x13, 0x1C, 0x1D, 0x1E, 0x41, 0x51, 0x5F` et assimilés. Mécanisme différent (extraction de bits + table de libellés), non implémenté à ce stade.
 
-### 4. Acquisition asynchrone
+**Anomalie documentée, pas un bug** : le PID `0x01` (octet B, bit 3 — type d'allumage) répond "essence" sur ce véhicule diesel. Le bit est lu conformément à la norme (vérifié par triangulation de sources) ; c'est l'ECU Marelli qui répond ainsi, pas une erreur de décodage.
 
-Les requêtes PID sont émises séquentiellement, mais le traitement des réponses est **asynchrone**.
+## Fiabilité — problèmes rencontrés et corrections
 
-Une réponse CAN/ISO-TP reste exploitable indépendamment du délai écoulé depuis l'émission de la requête. Les réponses tardives sont associées à leur PID et mettent à jour la dernière valeur connue ; elles ne sont pas rejetées uniquement en raison de leur temps d'arrivée.
-
-Une seule requête est active côté émission à la fois, mais la réception CAN continue indépendamment de l'ordonnancement des requêtes.
-
-Les réponses positives et négatives sont traitées. Les codes NRC sont conservés comme informations de diagnostic ; `0x78 Response Pending` n'est pas considéré comme une erreur.
-
-Les cinq valeurs principales sont suivies :
-
-| PID | Donnée | Colonne CSV |
+| Symptôme observé | Cause réelle | Correction |
 |---|---|---|
-| `0C` | régime moteur | `regime_trmin` |
-| `23` | pression rail | `rail_kPa` |
-| `0B` | pression MAP / turbo | `map_kPa` |
-| `49` | position pédale | `pedale_pct` |
-| `0D` | vitesse véhicule | `vitesse_kmh` |
+| ~45 % de PID sans réponse | Requête suivante envoyée trop tôt après une réponse rapide (violation d'un délai de repos minimal) | Cycle de durée fixe **80 ms** par PID (≥ N_Bs=75ms, ISO 15765-4 tableau 6), qu'il y ait réponse rapide ou non |
+| STOP LOG et rafraîchissement de page bloqués pendant le log | `server.handleClient()` appelé une seule fois par PID (~80-720ms d'écart) | Appelé à chaque itération de l'attente CAN |
+| Blocage total, y compris hors connexion (sans véhicule) | Sans accusé de réception (ACK) d'un autre nœud CAN, le MCP2515 retransmet indéfiniment en interne ; le bit TXREQ ne redescend jamais, bloquant tout envoi suivant | Attente bornée à 10 ms puis abandon forcé de l'émission précédente |
+| Blocage progressif pendant un trajet long | Écriture flash (`flush()`) à chaque cycle, pouvant geler le WiFi le temps de l'opération | Tampon RAM, écriture flash espacée (5 s), jamais en rafale |
 
-Une **seule piste de pédale**, PID `49`, est utilisée.
+Une instrumentation de debug (`Serial.print`, 115200 bauds) reste en place dans le code — peu coûteuse, déjà utile une fois pour diagnostiquer le point de blocage ci-dessus.
 
-La cadence cible du journal est de **100 ms**, soit environ **10 lignes/s**.
-
-## Journal CSV
-
-Le journal est stocké dans la mémoire flash **LittleFS** de l'ESP32.
-
-Le fichier est :
-
-```text
-/log.csv
-```
-
-Le fichier contient à la fois les informations de session, les résultats des scans et les données de conduite.
-
-En-tête des données :
-
-```csv
-horodatage,ms,regime_trmin,rail_kPa,map_kPa,pedale_pct,vitesse_kmh,pid_brut,val_brut
-```
-
-Les informations de diagnostic et les résultats des scans sont conservés sous forme de lignes commençant par `#`.
-
-L'écriture LittleFS est **tamponnée** afin de limiter les écritures flash et de ne pas bloquer inutilement le traitement CAN.
-
-Le firmware surveille également l'espace disponible et arrête le journal si la mémoire devient insuffisante.
-
-## Interface de conduite
-
-La page web affiche :
-
-- régime moteur ;
-- vitesse ;
-- pédale ;
-- pression rail ;
-- MAP / pression turbo ;
-- état de la session ;
-- occupation de la mémoire flash ;
-- nombre de lignes enregistrées.
-
-Les valeurs sont rafraîchies en continu depuis `/stat`.
-
-Les contrôles disponibles sont :
-
-- **START LOG**
-- **ARRET LOG**
-- **TELECHARGER CSV**
-- **CHECK DEFAUTS**
-- **RESET DEFAUTS**
-- **PURGE**
-
-Les commandes techniques CAN ne sont pas exposées dans l'interface de conduite.
-
-L'en-tête affiche la version du firmware et la date de release, par exemple :
-
-> **NEMO-OBD V6.3 — 05 SEP 2026**
-
-## Téléchargement du journal
-
-Le bouton **TELECHARGER CSV** récupère le fichier directement depuis l'ESP32.
-
-Le fichier téléchargé est :
-
-```text
-log_nemo.csv
-```
-
-La purge n'est effectuée **qu'après réception effective du fichier**.
-
-Après téléchargement réussi :
-
-1. le journal est fermé ;
-2. le fichier est supprimé ;
-3. l'état de session est supprimé ;
-4. l'ESP32 redémarre.
-
-Un téléchargement interrompu ne détruit donc pas le journal.
-
-## Diagnostic des défauts
-
-Les fonctions de diagnostic sont accessibles depuis la page web ou la console série lorsque le journal est arrêté.
-
-### CHECK DEFAUTS
-
-Lecture des défauts :
-
-- mode `03` : défauts mémorisés ;
-- mode `07` : défauts en attente ;
-- mode `0A` : défauts permanents.
-
-### RESET DEFAUTS
-
-La séquence `RESET!` :
-
-1. relève les défauts ;
-2. relève les données gelées disponibles ;
-3. écrit les informations dans le journal ;
-4. exécute l'effacement OBD mode `04` ;
-5. effectue une nouvelle lecture.
-
-## Console série
-
-La console USB fonctionne à :
-
-```text
-115200 bauds
-```
-
-Quelques commandes disponibles :
-
-| Commande | Effet |
-|---|---|
-| `HELP?` | aide des commandes |
-| `PING?` | test de vie |
-| `INFO?` | informations ESP32 / MCP2515 |
-| `INIT?` | réinitialisation MCP2515 |
-| `LOG ON` | démarre une session |
-| `LOG OFF` | arrête une session |
-| `LOG LAST` | dernière ligne mémorisée |
-| `STAT?` | état du système et du journal |
-| `BUS?` | compteurs CAN |
-| `DTC` | défauts 03 + 07 + 0A |
-| `DTCP` | défauts en attente |
-| `DTCX` | défauts permanents |
-| `FRZ` | données gelées |
-| `RESET!` | lecture, effacement puis nouvelle lecture des défauts |
-| `PID xx` | requête d'une PID OBD |
-| `PURGE!` | suppression du journal |
-| `ECHO ON/OFF` | active/désactive l'écho du journal sur la console |
-| `TIME! <epoch>` | fournit la base d'horodatage au module |
-
-## ISO-TP et réponses diagnostiques
-
-Le transport diagnostic utilise ISO-TP pour les messages dépassant une trame CAN simple.
-
-Le firmware prend en charge :
-
-- Single Frame ;
-- First Frame ;
-- Consecutive Frames ;
-- Flow Control ;
-- réassemblage des réponses multi-trames.
-
-Une réponse diagnostique est identifiée par son contenu et non par un délai arbitraire.
-
-Exemple :
-
-```text
-requête       01 0C
-réponse       41 0C AA BB
-```
-
-La réponse `41 0C AA BB` met à jour la valeur du PID `0C`, même si elle arrive après le passage de l'ordonnanceur à une autre requête.
-
-Les réponses négatives de forme :
-
-```text
-7F <service> <NRC>
-```
-
-sont également traitées.
-
-Le NRC `0x78` (**Response Pending**) indique que la requête a été reçue et que le calculateur poursuit son traitement ; il n'est pas traité comme une absence de réponse.
-
-## Scan OBD
-
-Le scan :
-
-1. sonde les adresses diagnostiques disponibles ;
-2. identifie les calculateurs qui répondent ;
-3. balaie les PID du mode `01` ;
-4. conserve les réponses reçues ;
-5. écrit les résultats dans le journal.
-
-Le scan est traité de manière asynchrone afin que la communication WiFi et le traitement CAN continuent à fonctionner pendant l'opération.
-
-Les réponses inattendues ou tardives restent exploitables.
-
-## PID supplémentaires
-
-Les PID détectées par le scan mais qui ne font pas partie des cinq grandeurs principales peuvent être conservées dans un ensemble de PID supplémentaires.
-
-Pendant l'acquisition, elles sont interrogées à tour de rôle.
-
-Elles apparaissent dans :
-
-```csv
-pid_brut,val_brut
-```
-
-Leur valeur est enregistrée sous forme brute, sans interprétation constructeur arbitraire.
-
-## Horodatage
-
-Le téléphone fournit au module une base de temps Unix au début de l'utilisation de l'interface.
-
-Les lignes de mesure comportent :
-
-- une date/heure ;
-- un temps milliseconde.
-
-Le temps milliseconde permet notamment de reconstruire précisément la chronologie des événements lors de l'analyse du journal.
-
-## Compilation et flash
-
-Environnement utilisé pour le développement :
-
-```text
-arduino-cli 1.5.1
-esp32:esp32 3.3.10
-```
-
-Compilation :
+## Compilation
 
 ```bash
-./obd_build.sh compile
+arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3 obd_can_bridge.ino
+arduino-cli upload  --fqbn esp32:esp32:XIAO_ESP32S3 -p /dev/ttyACM0 obd_can_bridge.ino
 ```
 
-Compilation et flash :
+Aucune bibliothèque tierce à installer.
 
-```bash
-./obd_build.sh flash
-```
+## Reste à faire
 
-Moniteur série :
-
-```bash
-./obd_build.sh mon
-```
-
-Cible :
-
-```text
-esp32:esp32:XIAO_ESP32S3
-```
-
-Aucune librairie Arduino tierce n'est nécessaire.
-
-## Historique des versions
-
-| Version | Évolution |
-|---|---|
-| v2.1 | 986 codes P0xxx FR embarqués, WiFi AP, base MCP2515 |
-| v2.2 | SNIF filtre delta |
-| v2.3 | SNIF masque automatique des compteurs roulants |
-| v2.4 | SNIF apprentissage de jeu de payloads |
-| v2.5 | requêtes OBD, repli 7DF → 7E0 |
-| v2.6 | commande PROBE?, driver 29 bits |
-| v2.7 | diagnostic 29 bits natif Marelli MJD8 |
-| v2.8 | décodage J1979 + SCAN? |
-| v2.9 | décodage PID 01 / 1C / 4A |
-| v3.0 | CLOCK! + log CSV horodaté |
-| v4.x | refonte du diagnostic 29 bits, scans et gestion des calculateurs |
-| v5.x | logger de conduite, scans exhaustifs, journal LittleFS et interface web |
-| v5.4 | acquisition multi-PID et optimisation du logger |
-| v6.0 | refonte du logger : acquisition déterministe, CSV à 100 ms, reprise après redémarrage |
-| v6.2 | stabilisation du logger et de l'interface |
-| **v6.3** | **refonte de l'acquisition : réception asynchrone, réponses tardives conservées, gestion des NRC/Response Pending, acquisition physique moteur et validation du démarrage sur RPM cohérent** |
+- Décodage niveau 2 (PID à bits énumérés : `0x01`, `0x1C`, `0x41`, etc.)
+- Bouton **CLEAR** (Mode 04 — effacement défauts), validé faisable, pas encore codé. Attention : réinitialise aussi les moniteurs de conformité ("readiness"), nécessite un cycle de conduite complet pour redevenir "prêt".
+- Lecture DTC (Mode 03/07/0A)
 
 ## Licence
 
 Usage personnel.
 
 **Auteur : Eric Perret (F1OCM)**
-
 Projet développé et maintenu pour le diagnostic du Citroën Nemo 1.3 HDi.
