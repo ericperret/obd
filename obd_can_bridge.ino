@@ -1,234 +1,3 @@
-/* ============================================================
- * obd_can_bridge.ino
- * ------------------------------------------------------------
- * Pont WiFi <-> Bus CAN OBD-II - logger haute cadence
- * Cible   : Seeed XIAO ESP32-S3 + Seeed CAN Bus Breakout
- *           (713-105100001) MCP2515 @ 16 MHz + SN65HVD230
- * Vehicule: Citroen Nemo 1.3 HDi (Fiat 199A2000 / PSA F13DTE5)
- *           VIN VF7AAFHZ0B8126615 - Marelli MJD 8F3.F6
- *           C-CAN 500 kbit/s - ISO 15765-4 adressage 29 bits
- * Auteur  : Eric Perret (F1OCM) - assistance Claude
- * Version : 6.0 - 2026-09-05
- * Licence : usage personnel
- * v6.0: refonte logger. Suppression de l'arbitrage A/B et du tick 1 Hz.
- *       Header OFF -> reboot demarreur -> Header RUN -> acquisition.
- *       CSV a cadence cible 100 ms, ecriture LittleFS tamponnee.
- *       Live limite aux cinq mesures demandees : RPM, vitesse, pedale
- *       (une seule piste PID 49), rail et MAP/turbo. Telechargement
- *       reussi -> purge -> reset ESP32.
- * ------------------------------------------------------------
- * ------------------------------------------------------------
- * v5.4: correction critique du scan : SCAN_TOURS comptait des tours CPU,
- *       pas des millisecondes. Sur ESP32 un PID muet pouvait donc etre
- *       declare mort avant meme que la reponse CAN ait eu le temps
- *       d arriver. Chaque emission dispose maintenant d une fenetre
- *       reelle de SCAN_WAIT_MS, sans bloquer HTTP. canSend29 ne bloque
- *       plus 20 ms apres chaque emission. /stat expose TX/RX/EFLG.
- *
- * v5.2: page. Jauge d'occupation flash live, rafraichie a la
- *       seconde depuis /stat : barre verte sous 70 %, orange a
- *       70, rouge a 90, libelle ko / ko, pourcentage, nombre de
- *       lignes, mention PLEINE quand logPlein est leve.
- *       Bouton PURGE arme en deux appuis, fenetre de 4 s, meme
- *       traitement visuel que le reset.
- *
- * v5.1: readBytesUntil remplace par une lecture caractere par
- *       caractere : la methode Stream porte un timeout de
- *       1000 ms par appel, une tempo cachee.
- *
- * v5.0: on journalise ce que le bus dit, pas ce qu'on attend.
- *       adrVu[256] est marque sur l'adresse SOURCE de toute
- *       trame recue pendant un scan, sans aucun rapport avec
- *       l'adresse interrogee au meme instant : une reponse
- *       tardive, ou un calculateur qui parle sans avoir ete
- *       sollicite, entre dans l'inventaire comme les autres.
- *       Les lignes # RAW portent scanSrc[], l'adresse qui a
- *       repondu, pour qu'un repondant inattendu reste visible.
- *       Plus aucun while dans le fichier : toutes les boucles
- *       sont bornees par un compteur. Sans watchdog arme, un
- *       while sur un registre SPI qui renvoie 0xFF ne sort
- *       jamais. Le drain RX passe par canDrain(), 64 passes.
- *
- * v4.9: sequence de scan conforme a la specification.
- *       Pre-header : tour complet des 256 adresses physiques en
- *       asynchrone, les repondantes s'accumulent dans un
- *       tableau. Aucune ecriture pendant le tour : un flush
- *       LittleFS immobilise la boucle et ferait perdre les
- *       reponses en vol. Le tour fini, le tampon RX est vide
- *       par pompage jusqu'a CANINTF nul - pas d'horloge - puis
- *       le tableau part en flash d'un bloc (# ADR xx, puis
- *       # BUS n ADRESSES).
- *       Le journal est ensuite relu (adrRelit) : la liste de
- *       travail vient du fichier, pas de la RAM, et le compte
- *       relu est ecrit (# RELECTURE n ADRESSES).
- *       Balayage : adresse par adresse, 256 PID, ce qui rentre
- *       va dans le tableau. La 256e emise, meme vidage du
- *       tampon RX, puis les 256 lignes partent en flash d'un
- *       bloc, puis l'adresse suivante.
- *       logWrite verifie le retour de println : une ecriture
- *       refusee leve logPlein et l'annonce sur le port serie
- *       au lieu de disparaitre.
- *
- * v4.8: inventaire du bus avant tout balayage, et suppression
- *       de la temporisation de scan.
- *       Etape 0 : 02 01 00 est emis sur les 256 adresses
- *       physiques 18DA<xx>F1. Toute reponse, positive ou 7F,
- *       prouve la presence d'un calculateur a xx ; la liste est
- *       ecrite (# BUS n ADRESSES, puis une ligne # ADR par
- *       cible). Plus aucune adresse n'est supposee connue.
- *       Etape 1 : les 256 PID du mode 01 sont balayees sur
- *       chaque adresse retenue. Le tableau est remis a l'init
- *       avant chaque cible et transcrit en entier apres :
- *       256 lignes # RAW <adr> <pid>, les muettes portant " -".
- *       Aucune horloge : un pas se termine des que la reponse
- *       attendue est entree, ou apres SCAN_TOURS pompes a vide
- *       pour une cible qui ne repond pas. SCAN_MS supprime.
- *       flagLoad accepte PH_ATTENTE : apres coupure demarreur,
- *       la reprise enchaine sur SCAN RUN au lieu de refaire un
- *       SCAN OFF moteur tournant.
- *
- * v4.7: le journal du scan devient exhaustif. scanVide() ne
- *       filtrait plus : une ligne "# RAW xx" par PID, avec ses
- *       octets ou " -" si muette. 256 lignes moteur arrete,
- *       256 lignes moteur tournant, systematiquement, quel que
- *       soit le nombre de repondantes. Drain de queue de 4 pas
- *       (100 ms) avant ecriture : les dernieres reponses ne se
- *       perdent plus.
- *
- * v4.6: deux corrections.
- *       Scan : les balayages emettaient sur l'adresse physique
- *       18DA10F1, muette sur ce calculateur - zero reponse sur
- *       les 256+256 PID alors que l'acquisition fonctionnelle
- *       repondait. Le scan emet desormais sur 18DB33F1.
- *       Telechargement : le bouton rapatriait le fichier sans
- *       jamais l'effacer. Il passe par fetch/blob et n'envoie
- *       PURGE! qu'apres reception effective ; un transfert
- *       interrompu laisse le journal intact.
- *
- * v4.5: ordre de session et codes defaut.
- *       Sequence : SCAN OFF -> attente demarrage -> SCAN RUN ->
- *       arbitrage A/B -> acquisition. L'arbitrage passe apres
- *       les deux scans : il se joue desormais moteur tournant,
- *       ou la reponse groupee est representative de ce que le
- *       calculateur sait faire en marche.
- *       Codes defaut : les trois modes de lecture sont la, 03
- *       memorises, 07 en attente, 0A permanents. Table de
- *       libelles francais en PROGMEM, sous-ensemble diesel de
- *       SAE J2012 / ISO 15031-6 (les familles allumage, sondes
- *       lambda et hybride sont ecartees : impossibles sur ce
- *       moteur). Un code hors table s'affiche seul.
- *       RESET! remplace CLEAR! : releve 03/07/0A et les donnees
- *       gelees, les ecrit dans le journal, efface (mode 04),
- *       puis releve a nouveau. Un code revenu en 03 juste apres
- *       est un defaut actif, pas un residu ; un 0A qui reste
- *       est normal tant que son moniteur n'a pas tourne.
- * ------------------------------------------------------------
- * v4.4: le scan devient asynchrone, comme l'acquisition.
- *       Defaut corrige : scanEcritReponse() comparait la trame
- *       recue a scanPid, deja incremente par le pas precedent.
- *       La comparaison echouait toujours, aucune ligne # RAW
- *       n'etait ecrite et brutN restait a 0.
- *       Le couplage requete/reponse est supprime. L'emission
- *       balaye 00..FF ; la pompe depose chaque reponse dans
- *       scanDat[pid], indexe par la PID que la reponse porte
- *       elle-meme. L'ordre d'arrivee n'a plus d'importance : une
- *       reponse en retard tombe dans sa case a un drain
- *       ulterieur, une PID muette laisse sa case vide. Le
- *       tableau est vide en debut de phase, ecrit d'un bloc a
- *       la fin.
- *       Un pas = une PID : on emet, on vide le tampon tant
- *       qu'il n'est pas vide, des qu'il est vide on passe a la
- *       suivante. Aucune attente, aucune sortie anticipee :
- *       le TX est sequentiel, le RX va dans le tableau, il n'y
- *       a aucun lien entre les deux. Un dernier pas de drain
- *       pur precede l'ecriture, pour la reponse de 0xFF.
- *       SCAN_MS passe de 100 a 25 ms : chaque scan tient en
- *       6,4 s au lieu de 26 s, 13 s pour les deux au lieu de 52.
- * ------------------------------------------------------------
- * v4.3: retour de la lecture des codes defaut et du
- *       dictionnaire SAE, retires a la reecriture.
- *         DTC  / DTCP  modes 03 et 07, memorises et en attente.
- *         PID xx       lit une PID, affiche les octets bruts
- *                      puis la valeur decodee.
- *       Ces trois commandes passent par obdAsk(), une requete
- *       bloquante a 300 ms en adressage physique : elle vide le
- *       bus a son propre compte et perturberait le tick, elle
- *       est donc refusee tant que le journal tourne.
- *       Le mode 04 (effacement des defauts) n'est pas remis :
- *       il efface aussi les donnees gelees, qui sont
- *       precisement l'interet du diagnostic.
- *       Le dictionnaire ne sert qu'a la relecture a l'ecran. Le
- *       journal continue d'ecrire des octets bruts.
- * ------------------------------------------------------------
- * v4.2a: enum Phase remonte avant toute fonction, le generateur
- *       de prototypes de l IDE Arduino le declarait trop tard.
- * ------------------------------------------------------------
- * v4.2: en-tete de session automatique + arbitrage automatique.
- *
- *       Sequence declenchee par LOG ON :
- *         1. ARBITRAGE  3 s   la requete groupee est emise et
- *            l'on compte les PID contenues dans la reponse.
- *            >= 5 PID reconnues -> mode A verrouille, sinon
- *            mode B (six requetes simples). Verdict ecrit dans
- *            le journal, affiche sur la page, memorise dans
- *            /mode.txt : les sessions suivantes demarrent
- *            directement sur le gagnant.
- *         2. SCAN OFF  26 s   balayage des 256 PID du mode 01,
- *            moteur arrete, adressage PHYSIQUE 18DA10F1, a
- *            10 requetes/s. Les bitmaps 00/20/40/60/80 ne sont
- *            pas consultes : ils sont declaratifs et ce
- *            calculateur repond a des PID qu'il omet de
- *            declarer. Toute reponse positive est ecrite telle
- *            quelle : # RAW <pid> <octets>.
- *         3. attente regime > 300 tr/min. Le reboot provoque
- *            par le demarreur est absorbe : l'avancement est
- *            dans /logon.txt, la reprise ne refait pas le scan
- *            deja termine.
- *         4. SCAN RUN  26 s   meme balayage, moteur tournant.
- *            La difference entre les deux listes est
- *            l'information : une PID qui ne repond qu'en
- *            marche est liee a la combustion.
- *         5. acquisition 1 Hz.
- *
- *       Le scan passe en adressage physique et non fonctionnel.
- *       En fonctionnel le BCM ou l'ABS renvoie un 7F avant que
- *       le moteur ne reponde : c'est ce qui avait fait declarer
- *       70, 71 et 77 non supportees a tort. Ce verdict est
- *       annule, elles sont re-balayees comme les 253 autres.
- *       6D (consigne de pression rail, structure Euro 5) est
- *       dans le lot.
- *
- *       Colonnes du CSV : les six PID au decodage certain, plus
- *       deux colonnes de tourniquet pid_brut / val_brut qui
- *       echantillonnent une PID vivante non identifiee par
- *       tick. Une valeur brute isolee ne dit rien, une serie
- *       temporelle mise en regard du regime et de la pedale se
- *       laisse identifier.
- *
- *       Emission bridee aux modes 01 et 22 en lecture. Jamais
- *       2E (writeDataByIdentifier), jamais 31 (routineControl).
- * ------------------------------------------------------------
- * v4.1: reecriture complete, boucle sans attente. canPump()
- *       vide les tampons MCP2515 a chaque tour de loop() :
- *       reponse diag 18DAF1xx -> reassemblage ISO-TP (SF/FF/CF
- *       + Flow Control) -> decodage -> depot dans la cellule.
- *       Toute autre trame est jetee sans etre memorisee. Le
- *       tick ecrit la ligne (cellule non remplie = vide), vide
- *       les cellules, emet la requete suivante, n'attend
- *       jamais. SPI porte a 10 MHz (etait 2 MHz) : en dessous
- *       la lecture d'une trame coute plus que son temps
- *       d'arrivee et la pompe prend du retard sur le bus.
- *       Supprime : per_ms, logDue[], logCand, logStrike[],
- *       logRetry[], logSup[], logAlive[], logDecl[], les deux
- *       passes, le budget de cycle, T_LOG_MS, l'etalement des
- *       echeances, les slots DID, le repli 11 bits.
- * ------------------------------------------------------------
- * v1.0 a v3.17 : acquisition sequentielle bloquante, une
- *       requete puis attente de la reponse. Abandonnee : le
- *       budget de cycle tronquait la fin de la liste des
- *       colonnes a chaque tour.
- * ============================================================ */
-
 #include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -238,7 +7,7 @@
 #include <FS.h>
 #include <LittleFS.h>
 
-#define FW_VER "6.3"
+#define FW_VER "8.4"
 
 /* ---------- WiFi point d'acces ------------------------------ */
 #define AP_SSID   "NEMO-OBD"
@@ -276,1871 +45,960 @@ WebServer server(80);
 #define R_TEC      0x1C
 #define R_REC      0x1D
 
-/* ---------- Adressage diagnostic 29 bits --------------------
- * Fonctionnel : tous les calculateurs repondent, dont des 7F
- *               parasites. Sert a l'acquisition, ou ces 7F sont
- *               sans consequence (pompe non bloquante).
- * Physique    : moteur seul. Sert au scan, pour que la liste
- *               obtenue soit bien celle du MJD8F3.
- * ----------------------------------------------------------- */
-#define ID29_FUNC 0x18DB33F1UL
-#define ID29_PHYS 0x18DA10F1UL
+/* ---------- Adresse ECU connue (decouverte en Phase 1) ------ */
+#define ECU_ADDR    0x10
+#define BROADCAST_ID 0x18DB33F1UL                                          // fonctionnel, prouve sur ce vehicule
+#define RESP_ID     (0x18DA0000UL | (0xF1UL << 8) | (uint32_t)ECU_ADDR)   // 0x18DAF110
+#define PID_TIMEOUT_MS 80  // N_Bs=75ms (ISO 15765-4 tableau 6) + marge
 
-/* ---------- Fichiers ---------------------------------------- */
-#define LOG_FICH   "/log.csv"
-#define LOG_FLAG   "/logon.txt"    /* etat de session, survit au reboot */
-/* v6 : plus d'arbitrage A/B persistant */
-#define LOG_MARGE  8192            /* octets libres mini avant arret    */
-#define TP_BUF     64
+// PID de test isole (connu/attendu supporte) - ajuster ici si besoin (ex: 0x4C)
+#define TEST_PID 0x0C
 
-/* ---------- Cadences ---------------------------------------- */
-#define LOG_PERIOD_MS 100UL        /* cadence cible : 10 echantillons/s */
-#define LOG_FLUSH_BYTES 4096UL
-#define LOG_FLUSH_MS    500UL
-/* SCAN_MS supprime en v4.8 : le scan n est plus temporise */
+/* ---------- Log continu : PID surveilles, ordre = synchronisation ---- */
+// Pedale et vitesse en premier et adjacents (paire critique de detection),
+// regime juste apres (verification embrayage/rapport), le reste ensuite.
+const uint8_t MONITOR_PIDS[] = {0x49, 0x0D, 0x0C, 0x04, 0x10, 0x0B, 0x23, 0x2C, 0x4A};
+#define NB_MONITOR (sizeof(MONITOR_PIDS)/sizeof(MONITOR_PIDS[0]))
+#define IDX_PEDALE 0   // position de 0x49 dans MONITOR_PIDS
+#define IDX_VITESSE 1  // position de 0x0D dans MONITOR_PIDS
+#define SEUIL_PEDALE_PCT 75.0f
+#define DUREE_RAFALE_MS 15000UL
+#define DUREE_MANCHE_NORMALE_MS 1000UL
 
-#define SCAN_WAIT_MS 50UL          /* attente reelle d une reponse CAN */
+/* ---------- Table de decodage Mode 01 (formules SAE J1979, Wikipedia) */
+// offset = decalage en octets apres SID+PID (donc data[3+offset]...)
+// nbytes = 1, 2 ou 4 ; signed_ = interpretation complement a 2
+struct PidDef { uint8_t pid; uint8_t offset; uint8_t nbytes; bool signed_; float mul; float add; const char* unit; const char* name; };
+const PidDef PIDTABLE[] = {
+  {0x04,0,1,false,100.0f/255.0f,0,   "%",     "Charge moteur"},
+  {0x05,0,1,false,1.0f,-40,          "C",     "Temp liquide refroidissement"},
+  {0x06,0,1,false,100.0f/128.0f,-100,"%",     "STFT Banc1"},
+  {0x07,0,1,false,100.0f/128.0f,-100,"%",     "LTFT Banc1"},
+  {0x08,0,1,false,100.0f/128.0f,-100,"%",     "STFT Banc2"},
+  {0x09,0,1,false,100.0f/128.0f,-100,"%",     "LTFT Banc2"},
+  {0x0A,0,1,false,3.0f,0,            "kPa",   "Pression carburant"},
+  {0x0B,0,1,false,1.0f,0,            "kPa",   "Pression admission"},
+  {0x0C,0,2,false,0.25f,0,           "rpm",   "Regime moteur"},
+  {0x0D,0,1,false,1.0f,0,            "km/h",  "Vitesse vehicule"},
+  {0x0E,0,1,false,0.5f,-64,          "deg",   "Avance allumage"},
+  {0x0F,0,1,false,1.0f,-40,          "C",     "Temp air admission"},
+  {0x10,0,2,false,0.01f,0,           "g/s",   "Debit MAF"},
+  {0x11,0,1,false,100.0f/255.0f,0,   "%",     "Position papillon"},
+  {0x14,0,1,false,1.0f/200.0f,0,     "V",     "O2 capteur1 tension"},
+  {0x14,1,1,false,100.0f/128.0f,-100,"%",     "O2 capteur1 STFT"},
+  {0x15,0,1,false,1.0f/200.0f,0,     "V",     "O2 capteur2 tension"},
+  {0x15,1,1,false,100.0f/128.0f,-100,"%",     "O2 capteur2 STFT"},
+  {0x16,0,1,false,1.0f/200.0f,0,     "V",     "O2 capteur3 tension"},
+  {0x16,1,1,false,100.0f/128.0f,-100,"%",     "O2 capteur3 STFT"},
+  {0x17,0,1,false,1.0f/200.0f,0,     "V",     "O2 capteur4 tension"},
+  {0x17,1,1,false,100.0f/128.0f,-100,"%",     "O2 capteur4 STFT"},
+  {0x18,0,1,false,1.0f/200.0f,0,     "V",     "O2 capteur5 tension"},
+  {0x18,1,1,false,100.0f/128.0f,-100,"%",     "O2 capteur5 STFT"},
+  {0x19,0,1,false,1.0f/200.0f,0,     "V",     "O2 capteur6 tension"},
+  {0x19,1,1,false,100.0f/128.0f,-100,"%",     "O2 capteur6 STFT"},
+  {0x1A,0,1,false,1.0f/200.0f,0,     "V",     "O2 capteur7 tension"},
+  {0x1A,1,1,false,100.0f/128.0f,-100,"%",     "O2 capteur7 STFT"},
+  {0x1B,0,1,false,1.0f/200.0f,0,     "V",     "O2 capteur8 tension"},
+  {0x1B,1,1,false,100.0f/128.0f,-100,"%",     "O2 capteur8 STFT"},
+  {0x1F,0,2,false,1.0f,0,            "s",     "Temps depuis demarrage"},
+  {0x21,0,2,false,1.0f,0,            "km",    "Distance MIL allume"},
+  {0x22,0,2,false,0.079f,0,          "kPa",   "Pression rampe (rel)"},
+  {0x23,0,2,false,10.0f,0,           "kPa",   "Pression rampe (abs, diesel)"},
+  {0x24,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-1"},
+  {0x24,2,2,false,1.0f/8192.0f,0,    "V",     "O2-1 tension large bande"},
+  {0x25,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-2"},
+  {0x25,2,2,false,1.0f/8192.0f,0,    "V",     "O2-2 tension large bande"},
+  {0x26,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-3"},
+  {0x26,2,2,false,1.0f/8192.0f,0,    "V",     "O2-3 tension large bande"},
+  {0x27,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-4"},
+  {0x27,2,2,false,1.0f/8192.0f,0,    "V",     "O2-4 tension large bande"},
+  {0x28,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-5"},
+  {0x28,2,2,false,1.0f/8192.0f,0,    "V",     "O2-5 tension large bande"},
+  {0x29,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-6"},
+  {0x29,2,2,false,1.0f/8192.0f,0,    "V",     "O2-6 tension large bande"},
+  {0x2A,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-7"},
+  {0x2A,2,2,false,1.0f/8192.0f,0,    "V",     "O2-7 tension large bande"},
+  {0x2B,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-8"},
+  {0x2B,2,2,false,1.0f/8192.0f,0,    "V",     "O2-8 tension large bande"},
+  {0x2C,0,1,false,100.0f/255.0f,0,   "%",     "EGR commande"},
+  {0x2D,0,1,false,100.0f/128.0f,-100,"%",     "Erreur EGR"},
+  {0x2E,0,1,false,100.0f/255.0f,0,   "%",     "Purge evap commandee"},
+  {0x2F,0,1,false,100.0f/255.0f,0,   "%",     "Niveau reservoir"},
+  {0x31,0,2,false,1.0f,0,            "km",    "Distance depuis effacement codes"},
+  {0x32,0,2,true, 0.25f,0,           "Pa",    "Pression vapeur evap"},
+  {0x33,0,1,false,1.0f,0,            "kPa",   "Pression barometrique"},
+  {0x34,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-1 (courant)"},
+  {0x34,2,2,true, 1.0f/256.0f,-128,  "mA",    "O2-1 courant large bande"},
+  {0x35,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-2 (courant)"},
+  {0x35,2,2,true, 1.0f/256.0f,-128,  "mA",    "O2-2 courant large bande"},
+  {0x36,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-3 (courant)"},
+  {0x36,2,2,true, 1.0f/256.0f,-128,  "mA",    "O2-3 courant large bande"},
+  {0x37,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-4 (courant)"},
+  {0x37,2,2,true, 1.0f/256.0f,-128,  "mA",    "O2-4 courant large bande"},
+  {0x38,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-5 (courant)"},
+  {0x38,2,2,true, 1.0f/256.0f,-128,  "mA",    "O2-5 courant large bande"},
+  {0x39,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-6 (courant)"},
+  {0x39,2,2,true, 1.0f/256.0f,-128,  "mA",    "O2-6 courant large bande"},
+  {0x3A,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-7 (courant)"},
+  {0x3A,2,2,true, 1.0f/256.0f,-128,  "mA",    "O2-7 courant large bande"},
+  {0x3B,0,2,false,1.0f/32768.0f,0,   "ratio", "Lambda O2-8 (courant)"},
+  {0x3B,2,2,true, 1.0f/256.0f,-128,  "mA",    "O2-8 courant large bande"},
+  {0x3C,0,2,false,0.1f,-40,          "C",     "Temp catalyseur B1S1"},
+  {0x3D,0,2,false,0.1f,-40,          "C",     "Temp catalyseur B2S1"},
+  {0x3E,0,2,false,0.1f,-40,          "C",     "Temp catalyseur B1S2"},
+  {0x3F,0,2,false,0.1f,-40,          "C",     "Temp catalyseur B2S2"},
+  {0x42,0,2,false,0.001f,0,          "V",     "Tension calculateur"},
+  {0x43,0,2,false,100.0f/255.0f,0,   "%",     "Charge absolue"},
+  {0x44,0,2,false,2.0f/65536.0f,0,   "ratio", "Ratio air/carburant commande"},
+  {0x45,0,1,false,100.0f/255.0f,0,   "%",     "Position papillon relative"},
+  {0x46,0,1,false,1.0f,-40,          "C",     "Temp air ambiant"},
+  {0x47,0,1,false,100.0f/255.0f,0,   "%",     "Position papillon B"},
+  {0x48,0,1,false,100.0f/255.0f,0,   "%",     "Position papillon C"},
+  {0x49,0,1,false,100.0f/255.0f,0,   "%",     "Position pedale D"},
+  {0x4A,0,1,false,100.0f/255.0f,0,   "%",     "Position pedale E"},
+  {0x4B,0,1,false,100.0f/255.0f,0,   "%",     "Position pedale F"},
+  {0x4C,0,1,false,100.0f/255.0f,0,   "%",     "Actionneur papillon commande"},
+  {0x4D,0,2,false,1.0f,0,            "min",   "Temps MIL allume"},
+  {0x4E,0,2,false,1.0f,0,            "min",   "Temps depuis effacement codes"},
+  {0x52,0,1,false,100.0f/255.0f,0,   "%",     "Ethanol %"},
+  {0x53,0,2,false,1.0f/200.0f,0,     "kPa",   "Pression evap absolue"},
+  {0x54,0,2,true, 1.0f,0,            "Pa",    "Pression evap (large)"},
+  {0x55,0,1,false,100.0f/128.0f,-100,"%",     "STFT O2 secondaire B1"},
+  {0x55,1,1,false,100.0f/128.0f,-100,"%",     "STFT O2 secondaire B3"},
+  {0x56,0,1,false,100.0f/128.0f,-100,"%",     "LTFT O2 secondaire B1"},
+  {0x56,1,1,false,100.0f/128.0f,-100,"%",     "LTFT O2 secondaire B3"},
+  {0x57,0,1,false,100.0f/128.0f,-100,"%",     "STFT O2 secondaire B2"},
+  {0x57,1,1,false,100.0f/128.0f,-100,"%",     "STFT O2 secondaire B4"},
+  {0x58,0,1,false,100.0f/128.0f,-100,"%",     "LTFT O2 secondaire B2"},
+  {0x58,1,1,false,100.0f/128.0f,-100,"%",     "LTFT O2 secondaire B4"},
+  {0x59,0,2,false,10.0f,0,           "kPa",   "Pression rampe carburant abs"},
+  {0x5A,0,1,false,100.0f/255.0f,0,   "%",     "Position pedale relative"},
+  {0x5B,0,1,false,100.0f/255.0f,0,   "%",     "Charge batterie hybride restante"},
+  {0x5C,0,1,false,1.0f,-40,          "C",     "Temp huile moteur"},
+  {0x5D,0,2,false,1.0f/128.0f,-210,  "deg",   "Calage injection carburant"},
+  {0x5E,0,2,false,0.05f,0,           "L/h",   "Debit carburant moteur"},
+  {0x63,0,2,false,1.0f,0,            "Nm",    "Couple moteur reference"},
+  {0x64,0,1,false,1.0f,-125,         "%",     "Couple % au ralenti"},
+  {0x64,1,1,false,1.0f,-125,         "%",     "Couple % point1"},
+  {0x64,2,1,false,1.0f,-125,         "%",     "Couple % point2"},
+  {0x64,3,1,false,1.0f,-125,         "%",     "Couple % point3"},
+  {0x64,4,1,false,1.0f,-125,         "%",     "Couple % point4"},
+  {0x66,1,2,false,1.0f/32.0f,0,      "g/s",   "Debit MAF capteur A"},
+  {0x66,3,2,false,1.0f/32.0f,0,      "g/s",   "Debit MAF capteur B"},
+  {0x67,1,1,false,1.0f,-40,          "C",     "Temp liquide refroid. capteur1"},
+  {0x67,2,1,false,1.0f,-40,          "C",     "Temp liquide refroid. capteur2"},
+  {0x68,1,1,false,1.0f,-40,          "C",     "Temp air admission B1S1"},
+  {0x68,2,1,false,1.0f,-40,          "C",     "Temp air admission B1S2"},
+  {0x68,3,1,false,1.0f,-40,          "C",     "Temp air admission B1S3"},
+  {0x68,4,1,false,1.0f,-40,          "C",     "Temp air admission B2S1"},
+  {0x68,5,1,false,1.0f,-40,          "C",     "Temp air admission B2S2"},
+  {0x68,6,1,false,1.0f,-40,          "C",     "Temp air admission B2S3"},
+  {0x69,1,1,false,100.0f/255.0f,0,   "%",     "EGR A commande"},
+  {0x69,2,1,false,100.0f/255.0f,0,   "%",     "EGR A reelle"},
+  {0x69,3,1,false,100.0f/128.0f,-100,"%",     "EGR A erreur"},
+  {0x69,4,1,false,100.0f/255.0f,0,   "%",     "EGR B commande"},
+  {0x69,5,1,false,100.0f/255.0f,0,   "%",     "EGR B reelle"},
+  {0x69,6,1,false,100.0f/128.0f,-100,"%",     "EGR B erreur"},
+  {0x6C,1,1,false,100.0f/255.0f,0,   "%",     "Actionneur papillon A commande"},
+  {0x6C,2,1,false,100.0f/255.0f,0,   "%",     "Position papillon A relative"},
+  {0x6C,3,1,false,100.0f/255.0f,0,   "%",     "Actionneur papillon B commande"},
+  {0x6C,4,1,false,100.0f/255.0f,0,   "%",     "Position papillon B relative"},
+  {0x6D,1,2,false,10.0f,0,           "kPa",   "Rampe A commandee"},
+  {0x6D,3,2,false,10.0f,0,           "kPa",   "Rampe A pression"},
+  {0x6D,5,1,false,1.0f,-40,          "C",     "Rampe A temperature"},
+  {0x6D,6,2,false,10.0f,0,           "kPa",   "Rampe B commandee"},
+  {0x6D,8,2,false,10.0f,0,           "kPa",   "Rampe B pression"},
+  {0x6D,10,1,false,1.0f,-40,         "C",     "Rampe B temperature"},
+  {0x70,1,2,false,1.0f/32.0f,0,      "kPa",   "Suralimentation A commandee"},
+  {0x70,3,2,false,1.0f/32.0f,0,      "kPa",   "Suralimentation A mesuree"},
+  {0x70,5,2,false,1.0f/32.0f,0,      "kPa",   "Suralimentation B commandee"},
+  {0x70,7,2,false,1.0f/32.0f,0,      "kPa",   "Suralimentation B mesuree"},
+  {0x72,1,1,false,100.0f/255.0f,0,   "%",     "Wastegate A commandee"},
+  {0x72,2,1,false,100.0f/255.0f,0,   "%",     "Wastegate A position"},
+  {0x72,3,1,false,100.0f/255.0f,0,   "%",     "Wastegate B commandee"},
+  {0x72,4,1,false,100.0f/255.0f,0,   "%",     "Wastegate B position"},
+  {0x7F,1,4,false,1.0f,0,            "s",     "Temps fonctionnement total moteur"},
+  {0x7F,5,4,false,1.0f,0,            "s",     "Temps ralenti total"},
+  {0x7F,9,4,false,1.0f,0,            "s",     "Temps PTO actif total"},
+  {0x84,0,1,false,1.0f,-40,          "C",     "Temp surface collecteur"},
+  {0x8D,0,1,false,100.0f/255.0f,0,   "%",     "Position papillon G"},
+  {0x8E,0,1,false,1.0f,-125,         "%",     "Couple friction moteur"},
+  {0x9A,2,2,false,1.0f/64.0f,0,      "V",     "Tension batterie hybride"},
+  {0x9A,4,2,true, 0.1f,0,            "A",     "Courant batterie hybride"},
+  {0x9D,0,2,false,0.02f,0,           "g/s",   "Debit carburant moteur (alt)"},
+  {0x9D,2,2,false,0.02f,0,           "g/s",   "Debit carburant vehicule"},
+  {0x9E,0,2,false,0.2f,0,            "kg/h",  "Debit gaz echappement"},
+  {0xA2,0,2,false,1.0f/32.0f,0,      "mg/coup","Debit carburant cylindre"},
+  {0xA6,0,4,false,0.1f,0,            "km",    "Kilometrage (odometre)"},
+  {0xAA,0,1,false,1.0f,0,            "km/h",  "Vitesse max limitee"},
+  {0xB2,0,1,false,100.0f/255.0f,0,   "%",     "Etat sante batterie"},
+  {0xD2,1,1,false,100.0f/255.0f,0,   "%",     "Etat energie certifiee batterie"},
+  {0xD2,2,1,false,100.0f/255.0f,0,   "%",     "Etat autonomie certifiee batterie"},
+  {0xD3,0,4,false,0.1f,0,            "km",    "Kilometrage moteur"}
+};
+#define NPID (sizeof(PIDTABLE)/sizeof(PIDTABLE[0]))
 
-/* ---------- Phases de session -------------------------------
- * Declare ici, avant toute fonction : le generateur de
- * prototypes de l'IDE Arduino insere ses declarations juste
- * apres les #include. Un type defini plus bas dans le fichier
- * serait inconnu au moment ou il ecrit le prototype de
- * flagLoad().
- * ----------------------------------------------------------- */
-enum Phase { PH_IDLE=0, PH_SCAN_OFF=1, PH_ATTENTE=2, PH_SCAN_RUN=3,
-             PH_ACQ=5 };
+String decodePid(uint8_t pid, uint8_t* data, uint8_t len) {
+  String out = "";
+  bool found = false;
+  for (uint16_t i = 0; i < NPID; i++) {
+    if (PIDTABLE[i].pid != pid) continue;
+    uint8_t off = 3 + PIDTABLE[i].offset;
+    if ((uint16_t)(off + PIDTABLE[i].nbytes - 1) >= len) continue;
 
-bool mcpOk = false;
-Print *OUT = &Serial;
+    long raw;
+    if (PIDTABLE[i].nbytes == 1) {
+      raw = PIDTABLE[i].signed_ ? (long)(int8_t)data[off] : (long)data[off];
+    } else if (PIDTABLE[i].nbytes == 2) {
+      uint16_t u = ((uint16_t)data[off] << 8) | data[off + 1];
+      raw = PIDTABLE[i].signed_ ? (long)(int16_t)u : (long)u;
+    } else {
+      uint32_t u = ((uint32_t)data[off] << 24) | ((uint32_t)data[off + 1] << 16) |
+                   ((uint32_t)data[off + 2] << 8) | data[off + 3];
+      raw = (long)u;
+    }
 
-/* ============================================================
- * Couche SPI bas niveau (reprise v3.17, horloge portee a 10 MHz)
- * ============================================================ */
-static inline void csL(){ digitalWrite(PIN_CS, LOW); }
-static inline void csH(){ digitalWrite(PIN_CS, HIGH); }
-
-void mcpReset(){
-  csL(); SPI.transfer(C_RESET); csH();
-  delay(10);
+    float val = PIDTABLE[i].mul * raw + PIDTABLE[i].add;
+    if (found) out += "; ";
+    out += String(val, 2) + " " + PIDTABLE[i].unit + " (" + PIDTABLE[i].name + ")";
+    found = true;
+  }
+  return found ? out : "Brut";
 }
 
-uint8_t mcpRead(uint8_t reg){
-  csL();
-  SPI.transfer(C_READ); SPI.transfer(reg);
-  uint8_t v = SPI.transfer(0x00);
-  csH();
-  return v;
+// Valeur numerique brute (premiere correspondance) - utilisee pour les
+// jauges et la detection perte de puissance, distincte de decodePid()
+// qui renvoie du texte formate.
+bool getNumeric(uint8_t pid, uint8_t* data, uint8_t len, float &out) {
+  for (uint16_t i = 0; i < NPID; i++) {
+    if (PIDTABLE[i].pid != pid) continue;
+    uint8_t off = 3 + PIDTABLE[i].offset;
+    if ((uint16_t)(off + PIDTABLE[i].nbytes - 1) >= len) continue;
+
+    long raw;
+    if (PIDTABLE[i].nbytes == 1) {
+      raw = PIDTABLE[i].signed_ ? (long)(int8_t)data[off] : (long)data[off];
+    } else if (PIDTABLE[i].nbytes == 2) {
+      uint16_t u = ((uint16_t)data[off] << 8) | data[off + 1];
+      raw = PIDTABLE[i].signed_ ? (long)(int16_t)u : (long)u;
+    } else {
+      uint32_t u = ((uint32_t)data[off] << 24) | ((uint32_t)data[off + 1] << 16) |
+                   ((uint32_t)data[off + 2] << 8) | data[off + 3];
+      raw = (long)u;
+    }
+    out = PIDTABLE[i].mul * raw + PIDTABLE[i].add;
+    return true;
+  }
+  return false;
 }
 
-void mcpWrite(uint8_t reg, uint8_t val){
-  csL();
-  SPI.transfer(C_WRITE); SPI.transfer(reg); SPI.transfer(val);
-  csH();
-}
+/* ---------- Fonction dediee : test d'un seul PID connu ------- */
+/* ---------- Etat du log continu ------------------------------ */
+enum LogMode { LOG_IDLE, LOG_NORMAL, LOG_RAFALE };
+LogMode  logMode = LOG_IDLE;
+uint32_t logT0 = 0;            // debut du log (horodatage relatif)
+uint32_t rafaleFinMs = 0;
+uint32_t mancheDebutMs = 0;
+uint8_t  pidIndex = 0;
 
-void mcpWriteN(uint8_t reg, const uint8_t *buf, uint8_t n){
-  csL();
-  SPI.transfer(C_WRITE); SPI.transfer(reg);
-  for(uint8_t i=0;i<n;i++) SPI.transfer(buf[i]);
-  csH();
-}
+float   pedalePrec = -1, vitessePrec = -1;
+bool    derniereOk[NB_MONITOR];
+String  derniereVal[NB_MONITOR];   // texte decode, pour les jauges
+float   derniereNum[NB_MONITOR];   // valeur numerique, pour les jauges
+File    logFile;
+String  logBuffer;             // tampon RAM, ecrit sur flash par lots (pas a chaque ligne)
+uint32_t derniereEcritureMs = 0;
+#define FLUSH_INTERVAL_MS 5000UL   // ecriture flash au plus toutes les 5 s
+#define RAFALE_PAUSE_MS 100UL      // pause entre manches en rafale (calmer le debit)
 
-void mcpBitMod(uint8_t reg, uint8_t mask, uint8_t val){
-  csL();
-  SPI.transfer(C_BITMOD); SPI.transfer(reg);
-  SPI.transfer(mask); SPI.transfer(val);
-  csH();
-}
-
-/* 500 kbit/s sur quartz 16 MHz. Filtres materiels grands ouverts
-   (RXM=11) : les reponses diag sont en 29 bits, le tri est fait
-   en logiciel par canPump().                                    */
-bool mcpInit(){
-  mcpReset();
-  mcpBitMod(R_CANCTRL, 0xE0, 0x80);
-  if((mcpRead(R_CANSTAT) & 0xE0) != 0x80) return false;
-
-  mcpWrite(R_CNF1, 0x00);
-  mcpWrite(R_CNF2, 0xF0);
-  mcpWrite(R_CNF3, 0x86);
-
-  mcpWrite(R_RXB0CTRL, 0x64);   /* RXM=11 + rollover vers RXB1 */
-  mcpWrite(R_RXB1CTRL, 0x60);
-  mcpWrite(R_CANINTE, 0x00);    /* pas d'IRQ : scrutation      */
-
-  mcpBitMod(R_CANCTRL, 0xE0, 0x00);
-  return (mcpRead(R_CANSTAT) & 0xE0) == 0x00;
-}
-
-/* ============================================================
- * Emission / reception CAN
- * ============================================================ */
-bool canSend29(uint32_t id, const uint8_t *data, uint8_t len){
-  /* TXB0 ne doit pas etre ecrase tant que TXREQ est actif.
-     On attend tres peu ici : le scan possede sa propre fenetre
-     d'attente et le serveur HTTP doit rester reactif. */
-  uint32_t t0 = millis();
-  while(mcpRead(R_TXB0CTRL) & 0x08){
-    if((uint32_t)(millis() - t0) >= 3){
-      /* Pas d'ACK ou bus bloque : abandon explicite du TX. */
-      mcpBitMod(R_TXB0CTRL, 0x08, 0x00);
-      return false;
+bool testerUnPid(uint8_t pid, uint32_t &respIdOut, uint8_t* dataOut, uint8_t &lenOut, uint8_t &bufOut) {
+  uint32_t d_id; uint8_t d_data[8]; uint8_t d_len; uint8_t d_buf;
+  uint16_t drainCount = 0;
+  while (mcp_recv(d_id, d_data, d_len, d_buf)) {   // vider les buffers avant l'essai
+    drainCount++;
+    if (drainCount > 100) {
+      Serial.println("[DBG] !! vidage buffers > 100 iterations, sortie forcee (bus flottant/bruit ?)");
+      break;
     }
     yield();
   }
 
-  uint8_t hdr[5];
-  hdr[0] = (id >> 21) & 0xFF;
-  hdr[1] = (((id >> 18) & 0x07) << 5) | 0x08 | ((id >> 16) & 0x03);
-  hdr[2] = (id >> 8) & 0xFF;
-  hdr[3] = id & 0xFF;
-  hdr[4] = len & 0x0F;
+  const uint8_t req_data[8] = {0x02, 0x01, pid, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
+  mcp_send_ext(BROADCAST_ID, req_data, 8);
 
-  mcpWriteN(R_TXB0SIDH, hdr, 5);
-  mcpWriteN(R_TXB0SIDH + 5, data, len);
-
-  csL(); SPI.transfer(C_RTS0); csH();
-
-  /* RTS lance l'emission. Ne pas attendre ici : l'ESP32 doit
-     continuer a servir /stat et /cmd pendant le scan. */
-  return true;
-}
-
-/* une trame si disponible, 0 sinon. Ne bloque jamais. */
-uint8_t canRecvAny(uint32_t *id, bool *ext, uint8_t *data){
-  uint8_t intf = mcpRead(R_CANINTF);
-  uint8_t base;
-  if(intf & 0x01)      base = R_RXB0SIDH;
-  else if(intf & 0x02) base = R_RXB1SIDH;
-  else return 0;
-
-  uint8_t sidh = mcpRead(base);
-  uint8_t sidl = mcpRead(base + 1);
-  uint8_t eid8 = mcpRead(base + 2);
-  uint8_t eid0 = mcpRead(base + 3);
-  uint8_t dlc  = mcpRead(base + 4) & 0x0F;
-  if(dlc > 8) dlc = 8;
-  for(uint8_t i=0;i<dlc;i++) data[i] = mcpRead(base + 5 + i);
-
-  *ext = sidl & 0x08;
-  if(*ext){
-    *id = ((uint32_t)sidh << 21) | ((uint32_t)(sidl >> 5) << 18)
-        | ((uint32_t)(sidl & 0x03) << 16) | ((uint32_t)eid8 << 8) | eid0;
-  }else{
-    *id = ((uint32_t)sidh << 3) | (sidl >> 5);
-  }
-  mcpBitMod(R_CANINTF, (base==R_RXB0SIDH)?0x01:0x02, 0x00);
-  return dlc;
-}
-
-/* ============================================================
- * Colonnes nommees - PID au decodage certain
- * ============================================================ */
-#define NCOL 5
-
-struct Col {
-  uint8_t     pid;
-  float       step;
-  const char *nom;
-};
-
-/* Une seule piste de pedale est volontairement retenue : PID 49. */
-const Col COL[NCOL] = {
-  {0x0C, 0.25f, "regime_trmin"},
-  {0x23, 10.0f, "rail_kPa"    },
-  {0x0B, 1.0f , "map_kPa"     },
-  {0x49, 0.1f , "pedale_pct"  },
-  {0x0D, 1.0f , "vitesse_kmh" }
-};
-
-float    cellVal[NCOL];
-uint32_t cellMs[NCOL];      /* 0 = pas ecrite depuis le dernier tick */
-float    cellShow[NCOL];    /* derniere valeur connue, pour l'IHM    */
-bool     cellSeen[NCOL];
-
-float    regimeNow = 0;     /* detection du demarrage moteur         */
-
-/* decodage SAE J1979 des cinq PID retenues.
-   0C = AB/4 . 23 = AB x10 . 0B = A . 49 et 04 = A x100/255 . 0D = A */
-static bool pidDecode(uint8_t pid, const uint8_t *v, uint8_t n, float *out){
-  switch(pid){
-    case 0x0C: if(n < 2) return false;
-               *out = (((uint16_t)v[0] << 8) | v[1]) / 4.0f;     return true;
-    case 0x23: if(n < 2) return false;
-               *out = (((uint16_t)v[0] << 8) | v[1]) * 10.0f;    return true;
-    case 0x0B: if(n < 1) return false; *out = v[0];              return true;
-    case 0x49:
-    case 0x04: if(n < 1) return false;
-               *out = v[0] * 100.0f / 255.0f;                    return true;
-    case 0x0D: if(n < 1) return false; *out = v[0];              return true;
-  }
-  return false;
-}
-
-/* ============================================================
- * Tourniquet des PID vivantes non nommees
- * Le scan remplit brutPid[]. Une PID par tick est interrogee et
- * journalisee brute. Une valeur isolee ne dit rien ; une serie
- * temporelle mise en regard du regime et de la pedale se laisse
- * identifier.
- * ============================================================ */
-#define BRUT_MAX 48
-uint8_t  brutPid[BRUT_MAX];
-uint8_t  brutN   = 0;
-uint8_t  brutIdx = 0;
-uint8_t  brutEnCours = 0xFF;
-uint32_t brutVal = 0;
-bool     brutOk  = false;
-
-/* Ordonnanceur d'acquisition : les requetes sont emises
- * sequentiellement, mais les reponses sont totalement asynchrones.
- * Une reponse positive est identifiee par son PID et reste valide
- * meme si elle arrive longtemps apres l'emission.
- *
- * Il n'existe donc PAS de timeout de validite d'une reponse.
- * ACQ_GAP_MS ne sert qu'a espacer les emissions pour laisser au
- * MCP2515 et au calculateur une respiration sur le bus. Plusieurs
- * requetes peuvent naturellement etre en vol lorsque l'ECU repond
- * tardivement ; le PID present dans chaque reponse permet de les
- * associer sans ambiguite. */
-#define ACQ_GAP_MS 20UL
-uint8_t  acqSlot = 0;
-uint32_t acqNextSend = 0;
-uint32_t acqLastSend[256];
-uint32_t acqRxCount[256];
-uint8_t  acqLastSrc[256];
-uint8_t  acqLastAgePid = 0xFF;
-uint32_t acqLateRsp = 0;
-uint32_t acqRspTotal = 0;
-uint32_t acqRspLastMs = 0;
-uint32_t nNrc78 = 0;
-uint32_t nNrc21 = 0;
-uint32_t nNrcOther = 0;
-uint8_t  lastNrcService = 0;
-uint8_t  lastNrc = 0;
-uint8_t  rspAdr = 0;
-float    rpmRef = 0;
-uint8_t  rpmStable = 0;
-uint32_t rpmLastSeen = 0;
-
-static bool brutConnue(uint8_t p){
-  for(uint8_t i=0;i<NCOL;i++) if(COL[i].pid == p) return true;
-  return false;
-}
-
-static void brutAjoute(uint8_t p){
-  if(brutConnue(p)) return;                       /* deja une colonne  */
-  if(p == 0x00 || p == 0x20 || p == 0x40
-  || p == 0x60 || p == 0x80 || p == 0xA0) return; /* bitmaps, inutiles */
-  for(uint8_t i=0;i<brutN;i++) if(brutPid[i] == p) return;
-  if(brutN < BRUT_MAX) brutPid[brutN++] = p;
-}
-
-/* ============================================================
- * Depot des valeurs dans les cellules
- * ============================================================ */
-
-static void cellPut(uint8_t pid, const uint8_t *v, uint8_t n){
-  uint32_t now = millis();
-
-  /* Une reponse tardive reste une reponse valide. Si une requete
-     plus recente du meme PID a deja ete emise, on la comptabilise
-     comme tardive, mais on NE LA JETTE PAS. */
-  if(acqLastSend[pid] && (int32_t)(now - acqLastSend[pid]) >= 0){
-    if(acqLastSend[pid] != acqRspLastMs && (now - acqLastSend[pid]) > ACQ_GAP_MS)
-      acqLateRsp++;
-  }
-  acqRxCount[pid]++;
-  acqLastSrc[pid] = rspAdr;
-  acqRspTotal++;
-  acqRspLastMs = now;
-
-  if(pid == brutEnCours){                    /* colonne de tourniquet */
-    uint32_t raw = 0;
-    for(uint8_t i=0;i<n && i<4;i++) raw = (raw << 8) | v[i];
-    brutVal = raw; brutOk = true;
-  }
-
-  float x;
-  if(!pidDecode(pid, v, n, &x)) return;
-  if(pid == 0x0C) regimeNow = x;
-  for(uint8_t i=0;i<NCOL;i++){
-    if(COL[i].pid != pid) continue;
-    cellVal[i]  = x;
-    cellMs[i]   = now;
-    cellShow[i] = x;
-    cellSeen[i] = true;
-  }
-}
-
-/* longueur normalisee des PID que l'on sait decouper dans une
-   reponse chainee. 0 = inconnue, on ne sait pas avancer.        */
-static uint8_t pidLen(uint8_t pid){
-  switch(pid){
-    case 0x0C: case 0x23: return 2;
-    case 0x0B: case 0x49: case 0x04: case 0x0D: return 1;
-  }
-  return 0;
-}
-
-/* une reponse mode 01 peut chainer plusieurs PID :
-   41 <pid> <donnees> <pid> <donnees> ...
-   Si la premiere PID n'est pas decoupable, la reponse est
-   forcement mono-PID : tout le reste lui appartient.            */
-static void rspSplit(const uint8_t *b, uint16_t n){
-  if(n < 2 || b[0] != 0x41) return;
-  uint16_t k = 1;
-  bool premier = true;
-  for(uint16_t g=0; g<64 && k < n; g++){
-    uint8_t p = b[k];
-    uint8_t l = pidLen(p);
-    if(!l){
-      if(premier) cellPut(p, b + k + 1, n - k - 1);
-      return;
-    }
-    if(k + 1 + l > n) return;
-    cellPut(p, b + k + 1, l);
-    k += 1 + l;
-    premier = false;
-  }
-}
-
-/* ============================================================
- * Pompe CAN - appelee a chaque tour de loop(), non bloquante
- * Reponse diag 18DAF1xx : reassemblage ISO-TP.
- * Tout le reste : jete, sans memoire.
- * ============================================================ */
-uint8_t  tpBuf[TP_BUF];
-uint16_t tpTotal = 0;
-uint16_t tpGot   = 0;
-uint8_t  tpSN    = 0;
-
-uint32_t nRx = 0, nRsp = 0, nDrop = 0, nNeg = 0, nTx = 0;
-
-/* ---------- Tableau du scan ---------------------------------
- * 256 entrees, une par PID. La pompe y depose ce qui arrive,
- * quand ca arrive : aucun lien entre l'ordre d'emission et
- * l'ordre de reception. Le tableau est vide en debut de phase,
- * ecrit d'un bloc a la fin.
- * ----------------------------------------------------------- */
-#define SCAN_DAT 6                /* octets utiles retenus par PID */
-uint8_t  scanDat[256][SCAN_DAT];
-uint8_t  scanLen[256];            /* 0 = pas de reponse            */
-uint8_t  scanSrc[256];            /* adresse source de la reponse  */
-uint8_t  adrVu[256];              /* 1 = cette adresse a parle     */
-bool     scanActif = false;       /* la pompe remplit le tableau   */
-bool     scanNeg   = false;       /* 7F recu depuis la derniere emission */
-bool     scanFini  = false;       /* toutes les adresses balayees  */
-uint8_t  adrPid    = 0;           /* adresse interrogee (etape 0)  */
-bool     adrRep    = false;       /* cette adresse a repondu       */
-
-static void scanRaz(){
-  memset(scanLen, 0, sizeof(scanLen));
-  memset(scanSrc, 0, sizeof(scanSrc));
-  scanNeg = false;
-}
-
-static void rspTraite(const uint8_t *b, uint16_t n){
-  if(n < 1) return;
-  if(scanActif){
-    adrVu[rspAdr] = 1;              /* qui a parle, attendu ou pas */
-    if(rspAdr == adrPid) adrRep = true;
-  }
-  if(b[0] == 0x7F){
-    nNeg++;
-    if(scanActif) scanNeg = true;
-    if(n >= 3){
-      lastNrcService = b[1];
-      lastNrc = b[2];
-      if(lastNrc == 0x78) nNrc78++;
-      else if(lastNrc == 0x21) nNrc21++;
-      else nNrcOther++;
-      /* Une reponse negative ne porte pas la PID demandee. Avec des
-         reponses pouvant arriver en retard, il serait faux de l'associer
-         artificiellement a la derniere requete emise. On journalise donc
-         le service et le NRC comme evenement protocolaire independant. */
-    }
-    return;
-  }
-  if(b[0] != 0x41 || n < 2) return;
-
-  if(scanActif){                  /* depot dans le tableau du scan */
-    uint8_t p = b[1];
-    uint8_t l = n - 2;
-    if(l > SCAN_DAT) l = SCAN_DAT;
-    memcpy(scanDat[p], b + 2, l);
-    scanSrc[p] = rspAdr;          /* qui a repondu a cette PID     */
-    scanLen[p] = l ? l : 1;       /* reponse vide = presente quand meme */
-    return;                       /* pas de decodage pendant le scan   */
-  }
-  rspSplit(b, n);
-}
-
-/* Vidage du tampon RX. Boucle bornee : un SPI decroche renvoie
-   0xFF en permanence, un while sur CANINTF ne sortirait jamais
-   et le watchdog reprendrait la main. 64 passes suffisent, le
-   MCP2515 n'a que deux tampons de reception.                  */
-static void canDrain(){
-  for(uint8_t g=0; g<64; g++){
-    if(!(mcpRead(R_CANINTF) & 0x03)) return;
-    canPump();
-  }
-}
-
-static void canFc(uint32_t rspId){
-  uint8_t fc[8] = {0x30, 0x00, 0x05, 0, 0, 0, 0, 0};   /* CTS, STmin 5 ms */
-  canSend29(0x18DA00F1UL | ((rspId & 0xFF) << 8), fc, 8);
-}
-
-void canPump(){
-  uint32_t id; bool ext; uint8_t d[8];
-  uint8_t n;
-
-  for(uint8_t garde=0; garde<32; garde++){
-    n = canRecvAny(&id, &ext, d);
-    if(!n) return;
-    nRx++;
-    if(!(ext && (id & 0xFFFFFF00UL) == 0x18DAF100UL)){ nDrop++; continue; }
-    nRsp++;
-    rspAdr = (uint8_t)(id & 0xFF);      /* qui parle */
-
-    uint8_t pci = d[0] >> 4;
-
-    if(pci == 0){                                    /* single frame */
-      uint8_t len = d[0] & 0x0F;
-      if(len > 7) len = 7;
-      rspTraite(d + 1, len);
-      tpTotal = 0;
-      continue;
-    }
-
-    if(pci == 1){                                    /* first frame  */
-      tpTotal = ((uint16_t)(d[0] & 0x0F) << 8) | d[1];
-      if(tpTotal > TP_BUF) tpTotal = TP_BUF;
-      tpGot = 0;
-      for(uint8_t i=2;i<8 && tpGot<tpTotal;i++) tpBuf[tpGot++] = d[i];
-      tpSN = 1;
-      canFc(id);
-      continue;
-    }
-
-    if(pci == 2 && tpTotal){                         /* consecutive  */
-      if((d[0] & 0x0F) != (tpSN & 0x0F)){ tpTotal = 0; continue; }
-      tpSN++;
-      for(uint8_t i=1;i<8 && tpGot<tpTotal;i++) tpBuf[tpGot++] = d[i];
-      if(tpGot >= tpTotal){ rspTraite(tpBuf, tpTotal); tpTotal = 0; }
-    }
-  }
-}
-
-/* ============================================================
- * Emission des requetes - aucune attente bloquante
- * Modes 01 et 22 en lecture seule. Jamais 2E, jamais 31.
- * ============================================================ */
-
-static void askOne(uint8_t pid, uint32_t addr){
-  uint8_t f[8] = {0x02, 0x01, pid, 0,0,0,0,0};
-  if(canSend29(addr, f, 8)) nTx++;
-}
-
-/* Acquisition : UNE PID par requete, emissions espacees.
- * Il n'y a aucun timeout qui invalide une reponse. Les reponses sont
- * traitees par canPump() au fil de leur arrivee et identifiees par
- * le PID contenu dans le message 41 xx. Les 5 PID nommees passent
- * en priorite ; une PID brute est injectee ensuite, puis le cycle
- * recommence. */
-static void acqSendNext(){
-  uint8_t pid = 0xFF;
-  bool isRaw = false;
-
-  if(acqSlot < NCOL){
-    pid = COL[acqSlot].pid;
-    acqSlot++;
-  }else{
-    if(brutN){
-      if(brutIdx >= brutN) brutIdx = 0;
-      pid = brutPid[brutIdx++];
-      isRaw = true;
-    }
-    acqSlot = 0;
-  }
-
-  if(pid == 0xFF) return;
-
-  if(isRaw){
-    brutEnCours = pid;
-    brutOk = false;
-  }else{
-    brutEnCours = 0xFF;
-  }
-
-  uint8_t f[8] = {0x02, 0x01, pid, 0,0,0,0,0};
-  if(canSend29(ID29_PHYS, f, 8)){
-    nTx++;
-    acqLastSend[pid] = millis();
-    acqLastAgePid = pid;
-  }
-}
-
-static void acqTick(){
-  /* Aucun timeout de reponse ici. Le CAN reste toujours capable de
-     recevoir et de traiter une reponse tardive dans canPump().
-     L'horloge ne cadence que les emissions. */
-  uint32_t now = millis();
-  if((int32_t)(now - acqNextSend) < 0) return;
-  acqSendNext();
-  acqNextSend = now + ACQ_GAP_MS;
-}
-
-/* ============================================================
- * Horodatage - base poussee par le telephone (TIME!)
- * ============================================================ */
-uint32_t modEpoch   = 0;
-uint32_t modEpochMs = 0;
-
-static void tsNow(uint32_t ms, char *buf, size_t max){
-  if(modEpoch){
-    time_t t = modEpoch + (ms - modEpochMs) / 1000;
-    struct tm tm; gmtime_r(&t, &tm);
-    snprintf(buf, max, "%04d-%02d-%02d %02d:%02d:%02d.%03u",
-             tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec,
-             (unsigned)((ms - modEpochMs) % 1000));
-  }else{
-    snprintf(buf, max, "%lu.%03lu", (unsigned long)(ms/1000),
-             (unsigned long)(ms%1000));
-  }
-}
-
-/* ============================================================
- * Journal LittleFS - append only, survit reboot / reflash
- * ============================================================ */
-File     logFile;
-bool     logFs    = false;
-bool     logMode  = false;
-bool     logEcho  = false;
-bool     logPlein = false;
-uint32_t logLines = 0;
-uint32_t logNext  = 0;
-uint32_t logBufBytes = 0;
-uint32_t logLastFlush = 0;
-uint16_t markNum  = 0;
-char     logLastLine[224] = "";
-char     uiStatus[80] = "PRET - appuyez sur START LOG";
-
-Phase    phase   = PH_IDLE;
-uint8_t  scanPid = 0;
-uint8_t  scanEmis = 0;            /* derniere PID emise, attendue en RX */
-
-static const char *phaseNom(){
-  switch(phase){
-    case PH_SCAN_OFF: return "scan moteur arrete";
-    case PH_ATTENTE:  return "demarrez le moteur";
-    case PH_SCAN_RUN: return "scan moteur tournant";
-    case PH_ACQ:      return "acquisition";
-    default:          return "arret";
-  }
-}
-
-/* progression du header : survit au reboot du demarreur */
-static void flagSave(){
-  File f = LittleFS.open(LOG_FLAG, "w");
-  if(!f) return;
-  f.print((int)phase);
-  f.close();
-}
-
-static Phase flagLoad(){
-  File f = LittleFS.open(LOG_FLAG, "r");
-  if(!f) return PH_IDLE;
-  int p = f.parseInt();
-  f.close();
-  if(p < PH_ATTENTE || p > PH_ACQ) return PH_IDLE;
-  return (Phase)p;
-}
-
-static void logHeaderCsv(char *out, size_t max){
-  size_t k = snprintf(out, max, "horodatage,ms");
-  for(uint8_t i=0;i<NCOL;i++)
-    k += snprintf(out+k, max-k, ",%s", COL[i].nom);
-  snprintf(out+k, max-k, ",pid_brut,val_brut");
-}
-
-static bool logOpen(){
-  if(!logFs) return false;
-  bool neuf = !LittleFS.exists(LOG_FICH);
-  logFile = LittleFS.open(LOG_FICH, "a");
-  if(!logFile) return false;
-  if(neuf){
-    char h[224]; logHeaderCsv(h, sizeof(h));
-    logFile.println(h);
-    logFlush();
-  }else{
-    /* Reconstitue le compteur apres un reboot sans modifier le fichier. */
-    File r = LittleFS.open(LOG_FICH, "r");
-    if(r){
-      logLines = 0;
-      char ln[256];
-      while(r.available()){
-        size_t n=0;
-        while(r.available() && n<sizeof(ln)-1){ int c=r.read(); if(c=='\n') break; if(c!='\r') ln[n++]=(char)c; }
-        ln[n]=0;
-        if(n && ln[0]!='#' && strncmp(ln,"horodatage",10)!=0) logLines++;
+  unsigned long t_start = millis();
+  bool got = false;
+  while (millis() - t_start < PID_TIMEOUT_MS) {
+    uint32_t rx_id; uint8_t rx_data[8]; uint8_t rx_len; uint8_t rx_buf;
+    if (!got && mcp_recv(rx_id, rx_data, rx_len, rx_buf)) {
+      if (rx_id == RESP_ID) {
+        respIdOut = rx_id;
+        lenOut = rx_len;
+        memcpy(dataOut, rx_data, rx_len);
+        bufOut = rx_buf;   // RXB0 (0) ou RXB1 (1) - pour verifier l'hypothese d'alternance
+        got = true;
       }
-      r.close();
     }
+    server.handleClient();   // sert le web pendant l'attente, sinon STOP/download restent bloques ~720ms/manche
+    yield();
   }
-  logLastFlush = millis();
-  return true;
+  // Cycle de duree fixe (PID_TIMEOUT_MS) qu'il y ait reponse rapide ou non,
+  // pour laisser un delai de repos constant avant la prochaine requete
+  // (hypothese : requete suivante trop rapprochee = ignoree par l'ECU).
+  return got;
 }
 
-static void logFlush(){
-  if(!logFile) return;
-  logFile.flush();
-  logBufBytes = 0;
-  logLastFlush = millis();
-}
+/* ---------- HTML Principal ---------------------------------- */
+const char* HTML_INDEX = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>NEMO OBD - FW 8.4</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; background: #000; color: #fff; padding: 20px; }
+    h1, h2 { color: #fff; }
+    button { padding: 15px 40px; font-size: 24px; font-weight: bold; cursor: pointer; border-radius: 8px; border: none; background: #007bff; color: white; transition: 0.3s; }
+    button:disabled { background: #444; color: #888; cursor: not-allowed; }
+    table { margin: 30px auto; border-collapse: collapse; width: 90%; max-width: 800px; background: #111; box-shadow: 0 0 10px rgba(255,255,255,0.1); }
+    th, td { border: 1px solid #333; padding: 12px; color: #fff; }
+    th { background: #222; }
+    #download { display: none; margin-top: 20px; font-size: 18px; text-decoration: none; padding: 10px 20px; background: #28a745; color: white; border-radius: 5px; }
+    .jauge-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; width: 95%; max-width: 760px; margin: 0 auto; }
+    .jauge { text-align: center; }
+    .jauge svg { display: block; margin: 0 auto; transform: rotate(-90deg); }
+    .jauge .val { font-weight: 500; margin-top: 6px; color: #fff; font-size: 17px; }
+    .jauge .lbl { font-weight: 500; font-size: 17px; color: #fff; }
+    #logStatus { margin: 10px 0; font-weight: bold; color: #fff; }
+    #logStatus.rafale { color: #ff4444; }
+    #downloadLog { display: none; margin-top: 10px; text-decoration: none; padding: 10px 20px; background: #28a745; color: white; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <h2>Log continu</h2>
+  <button id="btnLog" onclick="toggleLog()">LOG</button>
+  <div id="logStatus">Arrete</div>
+  <a id="downloadLog" href="/download_log" download="drivelog.csv">Telecharger log CSV</a>
+  <button id="btnPurge" onclick="purgerLog()" style="background:#c0392b;">PURGER LOG</button>
+  <div id="fsBarWrap" style="width:95%;max-width:760px;margin:12px auto;background:#333;border-radius:6px;overflow:hidden;height:22px;">
+    <div id="fsBar" style="height:100%;width:0%;background:#2ecc71;transition:width 0.3s;"></div>
+  </div>
+  <div id="fsText" style="margin-bottom:10px;color:#ccc;">-- </div>
+  <div id="jauges" class="jauge-grid"></div>
 
-static void logWrite(const char *s){
-  if(logFile){
-    size_t w = logFile.println(s);
-    if(!w && !logPlein){
-      logPlein = true;
-      Serial.println("# ECRITURE FLASH REFUSEE");
+  <hr style="border-color:#333; margin:30px 0;">
+
+  <h1>Scan PID - ECU 0x10 (Nemo C-CAN) - FW 8.4</h1>
+  <button id="btnCall" onclick="startCall()">CALL</button>
+  <br><br>
+  <button id="btnTest" onclick="testPid()">TEST PID 0x0C</button>
+  <div id="testResult" style="margin-top:10px;font-weight:bold;"></div>
+  <br>
+  <a id="download" href="/download" download="result.csv">Telecharger CSV</a>
+  <table>
+    <thead>
+      <tr><th>PID</th><th>Reponse</th><th>Buf</th><th>Donnees (Hex)</th><th>Decodage</th></tr>
+    </thead>
+    <tbody id="results">
+    </tbody>
+  </table>
+
+  <script>
+    function startCall() {
+      const btn = document.getElementById('btnCall');
+      const tbody = document.getElementById('results');
+      const dl = document.getElementById('download');
+
+      btn.disabled = true;
+      tbody.innerHTML = '';
+      dl.style.display = 'none';
+
+      const evtSource = new EventSource('/do_call');
+
+      evtSource.onmessage = function(e) {
+        const res = JSON.parse(e.data);
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${res.pid}</td><td>${res.rep}</td><td>${res.buf}</td><td>${res.data}</td><td>${res.info}</td>`;
+        tbody.appendChild(tr);
+      };
+
+      evtSource.addEventListener('done', function(e) {
+        evtSource.close();
+        btn.disabled = false;
+        dl.style.display = 'inline-block';
+      });
+
+      evtSource.onerror = function(e) {
+        evtSource.close();
+        btn.disabled = false;
+      };
     }
-    if(w) logBufBytes += w;
-    if(logBufBytes >= LOG_FLUSH_BYTES || millis() - logLastFlush >= LOG_FLUSH_MS)
-      logFlush();
-  }
-  if(logEcho) Serial.println(s);
-}
-
-static void logWriteTs(const char *quoi){
-  char ts[32], l[80];
-  tsNow(millis(), ts, sizeof(ts));
-  snprintf(l, sizeof(l), "# %s %s", quoi, ts);
-  logWrite(l);
-}
-
-/* ============================================================
- * Acquisition v6 : pas d'arbitrage multi-PID.
- * Le format d'acquisition est fixe et deterministe.
- * ============================================================ */
-
-/* ============================================================
- * Phases 2 et 4 : inventaire du bus, puis 256 PID par adresse
- * ------------------------------------------------------------
- * Etape 0 : les 256 adresses physiques 18DA<xx>F1 recoivent
- *           02 01 00. Toute reponse - positive ou 7F - prouve
- *           la presence d'un calculateur a xx. La liste est
- *           ecrite dans le journal.
- * Etape 1 : pour chaque adresse retenue, les 256 PID du mode 01
- *           sont balayees sur cette adresse. Le tableau est
- *           remis a l'init avant chaque cible et transcrit en
- *           entier apres : 256 lignes, muettes comprises.
- *
- * Aucune temporisation. Un pas se termine des que la reponse
- * attendue est entree, ou apres SCAN_TOURS passages a vide de
- * la pompe pour une cible muette.
- * ============================================================ */
-#define SCAN_TOURS 400            /* diagnostic uniquement, plus decisionnel */
-#define ADR_MAX    16             /* calculateurs retenus au maximum */
-
-uint8_t  adrTab[ADR_MAX];
-uint8_t  adrN    = 0;             /* adresses trouvees               */
-uint8_t  adrIdx  = 0;             /* adresse en cours de balayage    */
-uint8_t  scanEtape = 0;           /* 0 = adresses, 1 = PID           */
-uint16_t scanTours = 0;           /* compteur de pompes, diagnostic      */
-uint32_t scanDeadline = 0;          /* fin reelle de la fenetre d attente */
-uint32_t scanCible = 0;           /* identifiant CAN de la cible     */
-
-static uint32_t adrId(uint8_t xx){
-  return 0x18DA00F1UL | ((uint32_t)xx << 8);
-}
-
-/* ---------- etape 0 : inventaire ----------------------------
- * Rien n'est ecrit pendant le balayage : un flush LittleFS
- * immobilise la boucle et fait perdre les reponses en vol. Le
- * marquage se fait dans adrVu[] sur l'adresse SOURCE de la
- * trame recue, jamais sur l'adresse interrogee : une reponse
- * tardive, ou une adresse qui parle sans avoir ete sollicitee,
- * est retenue comme les autres. La flash est ecrite une seule
- * fois, tampon RX vide, a la fin du tour complet.           */
-static void adrEcrit(){
-  char l[96];
-  adrN = 0;
-  for(uint16_t x=0;x<256;x++){
-    if(!adrVu[x]) continue;
-    snprintf(l, sizeof(l), "# ADR %02X  (18DA%02XF1 -> 18DAF1%02X)",
-             (unsigned)x, (unsigned)x, (unsigned)x);
-    logWrite(l);
-    if(adrN < ADR_MAX) adrTab[adrN++] = (uint8_t)x;
-  }
-  snprintf(l, sizeof(l), "# BUS %u ADRESSES", adrN);
-  logWrite(l);
-  logFlush();
-}
-
-/* ---------- relecture du journal ----------------------------
- * La liste de travail n'est pas celle de la RAM : le fichier
- * est rouvert en lecture et les lignes # ADR du bloc courant
- * sont relues. Le compte relu est ecrit, meme s'il est nul. */
-static void adrRelit(){
-  adrN = 0;
-  if(logFile) logFile.flush();
-  File f = LittleFS.open(LOG_FICH, "r");
-  if(!f){ logWrite("# RELECTURE IMPOSSIBLE - FICHIER ABSENT"); return; }
-
-  char ln[128];
-  for(uint32_t g=0; g<200000 && f.available(); g++){
-    size_t k = 0;                     /* lecture directe, sans Stream */
-    for(uint16_t c=0; c<sizeof(ln)-1 && f.available(); c++){
-      int ch = f.read();
-      if(ch < 0 || ch == '\n') break;
-      if(ch != '\r') ln[k++] = (char)ch;
+    function testPid() {
+      const div = document.getElementById('testResult');
+      div.textContent = '...';
+      fetch('/test_pid').then(r => r.json()).then(res => {
+        div.textContent = res.ok
+          ? ('PID ' + res.pid + ' -> ' + res.resp + ' | ' + res.data + ' | ' + res.info)
+          : ('PID ' + res.pid + ' -> aucune reponse');
+      });
     }
-    ln[k] = 0;
-    if(!strncmp(ln, "# SCAN OFF", 10) || !strncmp(ln, "# SCAN RUN", 10))
-      adrN = 0;                       /* nouveau bloc : on repart    */
-    else if(!strncmp(ln, "# ADR ", 6)){
-      unsigned v = 0;
-      if(sscanf(ln + 6, "%2X", &v) == 1 && adrN < ADR_MAX)
-        adrTab[adrN++] = (uint8_t)v;
+
+    // ---- Jauges / log continu ----
+    // idx = position dans le tableau pids[] renvoye par /log_status, qui suit
+    // l'ordre de LECTURE CAN (MONITOR_PIDS, fige pour la synchronisation).
+    // L'ordre ci-dessous est l'ordre d'AFFICHAGE, independant du precedent.
+    var JAUGES = [
+      {idx:0, label:'Pedale D',   max:100,    unit:'%'},
+      {idx:8, label:'Pedale E',   max:100,    unit:'%'},
+      {idx:1, label:'Vitesse',    max:200,    unit:'km/h'},
+      {idx:2, label:'Regime',     max:5000,   unit:'rpm'},
+      {idx:3, label:'Charge',     max:100,    unit:'%'},
+      {idx:4, label:'MAF',        max:50,     unit:'g/s'},
+      {idx:5, label:'P admission',max:250,    unit:'kPa'},
+      {idx:6, label:'P rampe',    max:200000, unit:'kPa'},
+      {idx:7, label:'EGR',        max:100,    unit:'%'}
+    ];
+    var RAYON = 45, CIRC = 2 * Math.PI * RAYON;
+
+    function initJauges() {
+      var div = document.getElementById('jauges');
+      JAUGES.forEach(function(j, i) {
+        var box = document.createElement('div');
+        box.className = 'jauge';
+        box.innerHTML =
+          '<svg width="140" height="140" viewBox="0 0 100 100">' +
+            '<circle cx="50" cy="50" r="' + RAYON + '" fill="none" stroke="#333" stroke-width="10"/>' +
+            '<circle id="arc' + i + '" cx="50" cy="50" r="' + RAYON + '" fill="none" stroke="#2ecc71" ' +
+              'stroke-width="10" stroke-dasharray="' + CIRC + '" stroke-dashoffset="' + CIRC + '" stroke-linecap="round"/>' +
+          '</svg>' +
+          '<div class="val" id="val' + i + '">--</div>' +
+          '<div class="lbl">' + j.label + '</div>';
+        div.appendChild(box);
+      });
     }
-  }
-  f.close();
 
-  char l[64];
-  snprintf(l, sizeof(l), "# RELECTURE %u ADRESSES", adrN);
-  logWrite(l);
-}
-
-static void adrPas(){
-  if(adrPid == 0xFF){                  /* tour complet termine       */
-    canDrain();                        /* tampon RX vide, borne      */
-    adrEcrit();                        /* tout ce qui a parle        */
-    adrRelit();                        /* liste relue dans le fichier*/
-    scanEtape = 1;
-    adrIdx    = 0;
-    if(!adrN){                         /* bus muet : rien a balayer  */
-      logWrite("# AUCUNE ADRESSE - SCAN ABANDONNE");
-      scanActif = false;
-      scanFini  = true;
-      return;
+    var logTimer = null, logging = false;
+    function toggleLog() {
+      var btn = document.getElementById('btnLog');
+      if (!logging) {
+        fetch('/log_start').then(function() {
+          logging = true; btn.textContent = 'STOP LOG';
+          document.getElementById('downloadLog').style.display = 'none';
+          logTimer = setInterval(majJauges, 500);
+        });
+      } else {
+        fetch('/log_stop').then(function() {
+          logging = false; btn.textContent = 'LOG';
+          clearInterval(logTimer);
+          var st = document.getElementById('logStatus');
+          st.textContent = 'Arrete'; st.className = '';
+          document.getElementById('downloadLog').style.display = 'inline-block';
+        });
+      }
     }
-    scanCible = adrId(adrTab[0]);
-    scanPid   = 0;
-    scanRaz();
-    char l[48];
-    snprintf(l, sizeof(l), "# SCAN ADR %02X", adrTab[0]);
-    logWrite(l);
-    scanEmis  = 0;
-    scanNeg   = false;
-    scanTours = 0;
-    askOne(0x00, scanCible);
-    scanDeadline = millis() + SCAN_WAIT_MS;
-    return;
-  }
-  adrPid++;
-  adrRep    = false;
-  scanTours = 0;
-  askOne(0x00, adrId(adrPid));         /* 02 01 00 a l'adresse xx    */
-  scanDeadline = millis() + SCAN_WAIT_MS;
-}
 
-/* ---------- etape 1 : 256 PID de l'adresse courante --------- */
-static void scanVide(){
-  uint16_t n = 0;
-  char l[160];
-  for(uint16_t p=0;p<256;p++){
-    /* l'adresse portee est celle qui a REPONDU, pas celle qu'on
-       a interrogee : un repondant inattendu reste visible      */
-    size_t k = snprintf(l, sizeof(l), "# RAW %02X %02X",
-                        scanLen[p] ? (unsigned)scanSrc[p]
-                                   : (unsigned)adrTab[adrIdx],
-                        (unsigned)p);
-    if(!scanLen[p]){
-      snprintf(l+k, sizeof(l)-k, " -");    /* case restee a l'init   */
-      logWrite(l);
-      continue;
+    function purgerLog() {
+      fetch('/log_purge').then(function(r) { return r.json(); }).then(function(d) {
+        document.getElementById('fsText').textContent = d.ok ? 'Log purge.' : ('Purge impossible : ' + d.raison);
+        majJauges();
+      });
     }
-    for(uint8_t i=0;i<scanLen[p] && k < sizeof(l)-4;i++)
-      k += snprintf(l+k, sizeof(l)-k, " %02X", scanDat[p][i]);
-    logWrite(l);
-    brutAjoute((uint8_t)p);
-    n++;
-  }
-  snprintf(l, sizeof(l), "# ADR %02X REPONDANTES %u / 256",
-           adrTab[adrIdx], n);
-  logWrite(l);
-  logFlush();
-}
 
-static void scanPas(){
-  if(scanPid == 0xFF){                 /* adresse terminee           */
-    canDrain();                        /* tampon RX vide, borne      */
-    scanVide();
-    if(++adrIdx >= adrN){              /* plus d'adresse             */
-      scanActif = false;
-      scanFini  = true;
-      return;
+    function majJauges() {
+      fetch('/log_status').then(function(r) { return r.json(); }).then(function(d) {
+        var st = document.getElementById('logStatus');
+        if (d.mode === 'rafale') {
+          st.textContent = 'RAFALE - ' + Math.max(0, Math.round(d.rafale_restant_ms / 1000)) + 's restantes';
+          st.className = 'rafale';
+        } else {
+          st.textContent = 'Normal (1 Hz)';
+          st.className = '';
+        }
+        var bar = document.getElementById('fsBar');
+        bar.style.width = d.fs_pct + '%';
+        bar.style.background = d.fs_pct > 85 ? '#e74c3c' : '#2ecc71';
+        document.getElementById('fsText').textContent =
+          d.fs_pct.toFixed(1) + '% stockage utilise (' + (d.fs_used / 1024).toFixed(0) + ' Ko / ' + (d.fs_total / 1024).toFixed(0) + ' Ko)';
+        JAUGES.forEach(function(j, slot) {
+          var p = d.pids[j.idx];
+          if (!p) return;
+          var frac = p.ok ? Math.max(0, Math.min(1, p.num / j.max)) : 0;
+          var arc = document.getElementById('arc' + slot);
+          if (arc) arc.setAttribute('stroke-dashoffset', CIRC * (1 - frac));
+          var val = document.getElementById('val' + slot);
+          if (val) val.textContent = p.ok ? (p.num.toFixed(1) + ' ' + j.unit) : '--';
+        });
+      });
     }
-    scanCible = adrId(adrTab[adrIdx]);
-    scanPid   = 0;
-    scanRaz();
-    char l[48];
-    snprintf(l, sizeof(l), "# SCAN ADR %02X", adrTab[adrIdx]);
-    logWrite(l);
-  }else scanPid++;
 
-  scanEmis  = scanPid;
-  scanNeg   = false;
-  scanTours = 0;
-  askOne(scanPid, scanCible);
-  scanDeadline = millis() + SCAN_WAIT_MS;
+    initJauges();
+    majJauges();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+
+/* ---------- Fonctions SPI Brutes MCP2515 -------------------- */
+
+void mcp_write(uint8_t reg, uint8_t value) {
+  digitalWrite(PIN_CS, LOW);
+  SPI.transfer(C_WRITE);
+  SPI.transfer(reg);
+  SPI.transfer(value);
+  digitalWrite(PIN_CS, HIGH);
 }
 
-/* ---------- avancement, commande par la reception ------------ */
-/* Appelee a chaque tour de loop() tant que la phase est un scan.
-   Elle ne consulte aucune horloge : le pas suivant part des que
-   la reponse est entree, ou apres SCAN_TOURS pompes a vide.   */
-static void scanTour(){
-  /* Une reponse CAN n'arrive pas "au prochain tour de loop".
-     L'ancien code comptait 400 tours de CPU : sur ESP32 cela
-     pouvait durer bien moins d'une milliseconde et le PID etait
-     deja considere muet. On attend maintenant une vraie duree
-     en millisecondes, tout en laissant loop() repasser par
-     server.handleClient(). */
-  canPump();
-
-  bool recu = (scanEtape == 0) ? adrRep
-                               : (scanLen[scanEmis] != 0 || scanNeg);
-
-  if(recu){
-    if(scanEtape == 0) adrPas();
-    else               scanPas();
-    return;
-  }
-
-  if((int32_t)(millis() - scanDeadline) < 0){
-    scanTours++;
-    return;
-  }
-
-  if(scanEtape == 0) adrPas();
-  else               scanPas();
-
-  if(!scanFini) return;
-
-  /* fin de la phase de scan */
-  if(phase == PH_SCAN_OFF){
-    logWrite("# FIN SCAN OFF");
-    snprintf(uiStatus, sizeof(uiStatus), "SCAN 1 OK - DEMARREZ LE MOTEUR");
-    phase = PH_ATTENTE;
-  }else{
-    logWrite("# FIN SCAN RUN");
-    snprintf(uiStatus, sizeof(uiStatus), "SCAN 2 OK - LOG EN COURS");
-    char l[64];
-    snprintf(l, sizeof(l), "# PID BRUTES SUIVIES %u", brutN);
-    logWrite(l);
-    logWrite("# ACQUISITION HAUTE CADENCE");
-    phase   = PH_ACQ;
-    logNext = millis() + LOG_PERIOD_MS;
-    flagSave();
-  }
-  flagSave();
+uint8_t mcp_read(uint8_t reg) {
+  digitalWrite(PIN_CS, LOW);
+  SPI.transfer(C_READ);
+  SPI.transfer(reg);
+  uint8_t res = SPI.transfer(0x00);
+  digitalWrite(PIN_CS, HIGH);
+  return res;
 }
 
-/* mise en place d'une phase de scan */
-static void scanDebut(Phase ph, const char *quoi){
-  phase      = ph;
-  scanEtape  = 0;
-  adrN       = 0;
-  adrIdx     = 0;
-  adrPid     = 0;
-  adrRep     = false;
-  scanPid    = 0;
-  scanEmis   = 0;
-  scanFini   = false;
-  scanTours  = 0;
-  scanActif  = true;
-  memset(adrVu, 0, sizeof(adrVu));
-  scanRaz();
-  logWriteTs(quoi);
-  flagSave();
-  askOne(0x00, adrId(0x00));           /* premiere adresse du bus */
-  scanDeadline = millis() + SCAN_WAIT_MS;
+void mcp_bitmod(uint8_t reg, uint8_t mask, uint8_t value) {
+  digitalWrite(PIN_CS, LOW);
+  SPI.transfer(C_BITMOD);
+  SPI.transfer(reg);
+  SPI.transfer(mask);
+  SPI.transfer(value);
+  digitalWrite(PIN_CS, HIGH);
 }
 
-/* ============================================================
- * Phase 5 : acquisition asynchrone, donnees par PID
- * ============================================================ */
-void logTickAcq(){
-  char ts[32];
-  uint32_t now = millis();
-  tsNow(now, ts, sizeof(ts));
-
-  size_t k = snprintf(logLastLine, sizeof(logLastLine), "%s,%lu",
-                      ts, (unsigned long)now);
-  for(uint8_t i=0;i<NCOL;i++){
-    if(cellMs[i]){
-      uint8_t dec = (COL[i].step >= 1.0f) ? 0 : 1;
-      k += snprintf(logLastLine+k, sizeof(logLastLine)-k, ",%.*f",
-                    dec, (double)cellVal[i]);
-    }else{
-      k += snprintf(logLastLine+k, sizeof(logLastLine)-k, ",");
-    }
-  }
-  if(brutEnCours != 0xFF && brutOk)
-    snprintf(logLastLine+k, sizeof(logLastLine)-k, ",%02X,%lu",
-             brutEnCours, (unsigned long)brutVal);
-  else
-    snprintf(logLastLine+k, sizeof(logLastLine)-k, ",,");
-
-  logWrite(logLastLine);
-  logLines++;
-
-  for(uint8_t i=0;i<NCOL;i++) cellMs[i] = 0;
-  brutOk = false;
-
-  if(LittleFS.totalBytes() - LittleFS.usedBytes() < LOG_MARGE){
-    logFlush();
-    logWrite("# FLASH PLEINE");
-    logFlush();
-    logPlein = true;
-    logMode  = false;
-    phase    = PH_IDLE;
-    if(logFile) logFile.close();
-    LittleFS.remove(LOG_FLAG);
-    return;
-  }
-
-  /* L'ordonnanceur CAN tourne independamment du rythme CSV.
-     La ligne CSV photographie les dernieres valeurs disponibles. */
+void mcp_reset() {
+  digitalWrite(PIN_CS, LOW);
+  SPI.transfer(C_RESET);
+  digitalWrite(PIN_CS, HIGH);
+  delay(10);
 }
 
-/* ============================================================
- * Marche / arret de session
- * ============================================================ */
-void logStart(bool reprise){
-  if(logMode) return;
-  if(!logOpen()){ OUT->println("# LOG: flash indisponible"); return; }
-  logPlein = false;
-  logMode  = true;
-  for(uint8_t i=0;i<NCOL;i++){ cellMs[i] = 0; cellSeen[i] = false; }
-  brutOk = false; brutEnCours = 0xFF;
-  acqSlot = 0;
-  acqNextSend = millis();
-  memset(acqLastSend, 0, sizeof(acqLastSend));
-  memset(acqRxCount, 0, sizeof(acqRxCount));
-  memset(acqLastSrc, 0, sizeof(acqLastSrc));
-  acqLastAgePid = 0xFF;
-  acqLateRsp = 0;
-  acqRspTotal = 0;
-  acqRspLastMs = 0;
-  rpmRef = 0;
-  rpmStable = 0;
-  rpmLastSeen = 0;
-
-  Phase repris = reprise ? flagLoad() : PH_IDLE;
-  char l[80];
-  snprintf(l, sizeof(l), "# LOG ON v%s", FW_VER);
-  logWrite(l);
-  logWriteTs("SESSION");
-
-  if(repris >= PH_ATTENTE){
-    phase = repris;
-    logWrite("# REPRISE apres coupure");
-    if(phase == PH_SCAN_RUN) scanDebut(PH_SCAN_RUN, "SCAN RUN");
-    if(phase == PH_ACQ){
-      logNext = millis() + LOG_PERIOD_MS;
-      logWrite("# REPRISE ACQUISITION");
-    }
-  }else{
-    logLines = 0;
-    brutN = 0; brutIdx = 0;
-    scanDebut(PH_SCAN_OFF, "SCAN OFF");
-  }
-  flagSave();
-  OUT->print("# session lancee, phase "); OUT->println(phaseNom());
+// Ecrit un ID 29 bits sur 4 registres consecutifs (SIDH,SIDL,EID8,EID0).
+// Utilise pour les trames TX ET pour les registres de masque/filtre RX,
+// qui partagent le meme format d'encodage cote MCP2515.
+void mcp_write_id_regs(uint8_t baseAddr, uint32_t id, bool setExide) {
+  uint8_t sidh = (id >> 21) & 0xFF;
+  uint8_t sidl = (((id >> 18) & 0x07) << 5) | (setExide ? 0x08 : 0x00) | ((id >> 16) & 0x03);
+  uint8_t eid8 = (id >> 8) & 0xFF;
+  uint8_t eid0 = id & 0xFF;
+  mcp_write(baseAddr, sidh);
+  mcp_write(baseAddr + 1, sidl);
+  mcp_write(baseAddr + 2, eid8);
+  mcp_write(baseAddr + 3, eid0);
 }
 
-void logStop(){
-  if(!logMode) return;
-  logMode = false;
-  phase   = PH_IDLE;
-  logWrite("# LOG OFF");
-  logFlush();
-  if(logFile) logFile.close();
-  LittleFS.remove(LOG_FLAG);
-  for(uint8_t i=0;i<NCOL;i++) cellSeen[i] = false;
-  OUT->println("# LOG OFF");
+void mcp_init() {
+  pinMode(PIN_CS, OUTPUT);
+  digitalWrite(PIN_CS, HIGH);
+  pinMode(PIN_INT, INPUT_PULLUP);
+
+  SPI.begin();
+
+  mcp_reset();
+
+  // Mode Configuration
+  mcp_bitmod(R_CANCTRL, 0xE0, 0x80);
+  delay(1);
+
+  // Vitesse : 500 kbps @ 16 MHz
+  mcp_write(R_CNF1, 0x00);
+  mcp_write(R_CNF2, 0xF0);
+  mcp_write(R_CNF3, 0x86);
+
+  // Filtre materiel : n'accepter que les reponses OBD physiques 0x18DAF1xx
+  // (masque = ignore uniquement l'octet adresse ECU). Tout le reste du trafic
+  // bus (chatter moteur, autres ECU) est elimine par le silicium, avant meme
+  // de remonter en SPI ou d'occuper l'un des 2 buffers de reception.
+  mcp_write_id_regs(0x20, 0x1FFFFF00UL, true);  // RXM0 (masque RXB0)
+  mcp_write_id_regs(0x00, 0x18DAF100UL, true);  // RXF0 (RXB0)
+  mcp_write_id_regs(0x04, 0x18DAF100UL, true);  // RXF1 (RXB0)
+  mcp_write_id_regs(0x24, 0x1FFFFF00UL, true);  // RXM1 (masque RXB1)
+  mcp_write_id_regs(0x08, 0x18DAF100UL, true);  // RXF2 (RXB1)
+
+  // RXB0 : filtres actifs (RXM=00), rollover vers RXB1 si plein (BUKT=1)
+  // RXB1 : filtres actifs (RXM=00)
+  mcp_write(R_RXB0CTRL, 0x04);
+  mcp_write(R_RXB1CTRL, 0x00);
+
+  // Vider les interruptions
+  mcp_write(R_CANINTF, 0x00);
+
+  // Passage en Mode Normal
+  mcp_bitmod(R_CANCTRL, 0xE0, 0x00);
+  delay(1);
 }
 
-void logPurge(){
-  if(logMode) logStop();
-  LittleFS.remove(LOG_FICH);
-  LittleFS.remove(LOG_FLAG);
-  logLines = 0;
-  brutN = 0; brutIdx = 0;
-  OUT->println("# PURGE OK");
-}
-
-static void downloadDone(){
-  if(logMode) logStop();
-  LittleFS.remove(LOG_FICH);
-  LittleFS.remove(LOG_FLAG);
-  logLines = 0;
-  brutN = 0; brutIdx = 0;
-  OUT->println("# TELECHARGEMENT TERMINE - RESET");
-  delay(100);
-  ESP.restart();
-}
-
-
-/* ============================================================
- * Machine d'etat de session - appelee a chaque tour de loop()
- * ============================================================ */
-void sessionTick(){
-  if(!logMode) return;
-  uint32_t now = millis();
-
-  switch(phase){
-    case PH_SCAN_OFF:
-    case PH_SCAN_RUN:
-      scanTour();
+void mcp_send_ext(uint32_t id, const uint8_t* data, uint8_t len) {
+  // Attendre que le buffer TXB0 soit libre, avec timeout. Sans accuse de
+  // reception (ACK) d'un autre noeud CAN, le controleur retransmet la trame
+  // precedente indefiniment en interne et TXREQ ne redescend jamais tout
+  // seul : au-dela de 10ms on force l'abandon plutot que d'attendre a l'infini.
+  uint32_t tAttente = millis();
+  while (mcp_read(R_TXB0CTRL) & 0x08) {
+    if (millis() - tAttente > 10) {
+      mcp_bitmod(R_TXB0CTRL, 0x08, 0x00);   // force TXREQ=0 : abandon de l'envoi precedent
+      Serial.println("[DBG] !! TXB0 bloque (pas d'ACK recu) - envoi precedent abandonne de force");
       break;
+    }
+    yield();
+  }
 
-    case PH_ATTENTE: {
-      static uint32_t tR = 0;
+  // Calcul du format d'ID Etendu 29 bits pour les registres du MCP2515
+  uint8_t sidh = (id >> 21) & 0xFF;
+  uint8_t sidl = (((id >> 18) & 0x07) << 5) | 0x08 | ((id >> 16) & 0x03);
+  uint8_t eid8 = (id >> 8) & 0xFF;
+  uint8_t eid0 = id & 0xFF;
 
-      /* Le demarrage n'est valide qu'apres plusieurs mesures RPM
-         coherentes. Une simple valeur >300 tr/min peut etre un artefact
-         de demarrage ou une reponse ancienne. */
-      if(cellSeen[0] && cellMs[0] != rpmLastSeen){
-        rpmLastSeen = cellMs[0];
-        float r = regimeNow;
-        if(r > 300){
-          if(rpmStable == 0) rpmRef = r;
-          float tol = rpmRef * 0.08f;
-          if(tol < 80.0f) tol = 80.0f;
-          if(fabsf(r - rpmRef) <= tol){
-            if(rpmStable < 10) rpmStable++;
-          }else{
-            rpmStable = 0;
-            rpmRef = r;
-          }
-        }else{
-          rpmStable = 0;
-          rpmRef = 0;
+  mcp_write(R_TXB0SIDH, sidh);
+  mcp_write(R_TXB0SIDH + 1, sidl);
+  mcp_write(R_TXB0SIDH + 2, eid8);
+  mcp_write(R_TXB0SIDH + 3, eid0);
+  mcp_write(R_TXB0SIDH + 4, len);
+
+  for (int i = 0; i < len; i++) {
+    mcp_write(R_TXB0SIDH + 5 + i, data[i]);
+  }
+
+  // Declenchement de l'envoi
+  digitalWrite(PIN_CS, LOW);
+  SPI.transfer(C_RTS0);
+  digitalWrite(PIN_CS, HIGH);
+}
+
+bool mcp_recv(uint32_t &id, uint8_t* data, uint8_t &len, uint8_t &bufOut) {
+  uint8_t intf = mcp_read(R_CANINTF);
+  uint8_t base_addr = 0;
+
+  if (intf & 0x01) {
+    base_addr = R_RXB0SIDH;
+    bufOut = 0;
+  } else if (intf & 0x02) {
+    base_addr = R_RXB1SIDH;
+    bufOut = 1;
+  } else {
+    return false; // Pas de donnees
+  }
+
+  uint8_t sidh = mcp_read(base_addr);
+  uint8_t sidl = mcp_read(base_addr + 1);
+  uint8_t eid8 = mcp_read(base_addr + 2);
+  uint8_t eid0 = mcp_read(base_addr + 3);
+  len = mcp_read(base_addr + 4) & 0x0F;
+
+  for (int i = 0; i < len; i++) {
+    data[i] = mcp_read(base_addr + 5 + i);
+  }
+
+  // Acquittement de l'interruption
+  if (base_addr == R_RXB0SIDH) mcp_bitmod(R_CANINTF, 0x01, 0x00);
+  else mcp_bitmod(R_CANINTF, 0x02, 0x00);
+
+  bool is_ext = (sidl & 0x08) != 0;
+  if (is_ext) {
+    id = ((uint32_t)sidh << 21) | ((uint32_t)(sidl >> 5) << 18) | ((uint32_t)(sidl & 0x03) << 16) | ((uint32_t)eid8 << 8) | eid0;
+    return true;
+  }
+  return false;
+}
+
+
+/* ---------- Setup & Loop ------------------------------------ */
+
+void setup() {
+  Serial.begin(115200);
+  Serial.printf("obd_can_bridge FW %s\n", FW_VER);
+  LittleFS.begin(true);
+
+  mcp_init();
+
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(100);
+  WiFi.softAPConfig(AP_IP, AP_IP, AP_MASK);
+
+  server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", HTML_INDEX);
+  });
+
+  server.on("/download", HTTP_GET, []() {
+    if (LittleFS.exists("/result.csv")) {
+      File f = LittleFS.open("/result.csv", "r");
+      server.streamFile(f, "text/csv");
+      f.close();
+    } else {
+      server.send(404, "text/plain", "Fichier introuvable.");
+    }
+  });
+
+  server.on("/test_pid", HTTP_GET, []() {
+    uint32_t respId; uint8_t data[8]; uint8_t len; uint8_t buf;
+    bool ok = testerUnPid(TEST_PID, respId, data, len, buf);
+
+    String pid_str = String((uint8_t)TEST_PID, HEX); pid_str.toUpperCase();
+    String json;
+    if (ok) {
+      String resp_str = String(respId, HEX); resp_str.toUpperCase();
+      String data_str = "";
+      for (int i = 0; i < len; i++) {
+        if (data[i] < 16) data_str += "0";
+        data_str += String(data[i], HEX) + " ";
+      }
+      data_str.toUpperCase(); data_str.trim();
+      String info = (len >= 3 && data[1] == 0x41) ? decodePid(TEST_PID, data, len) :
+                    (len >= 4 && data[1] == 0x7F) ? ("NEG NRC " + String(data[3], HEX)) : "Brut";
+      json = "{\"ok\":true,\"pid\":\"0x" + pid_str + "\",\"resp\":\"0x" + resp_str +
+             "\",\"data\":\"" + data_str + "\",\"info\":\"" + info + "\",\"buf\":" + String(buf) + "}";
+    } else {
+      json = "{\"ok\":false,\"pid\":\"0x" + pid_str + "\"}";
+    }
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/do_call", HTTP_GET, []() {
+    // Entetes Server-Sent Events (SSE)
+    server.sendContent("HTTP/1.1 200 OK\r\n");
+    server.sendContent("Content-Type: text/event-stream\r\n");
+    server.sendContent("Cache-Control: no-cache\r\n");
+    server.sendContent("Connection: keep-alive\r\n\r\n");
+
+    WiFiClient client = server.client();
+    String csv_content = "PID,Reponse,Buffer,Donnees,Decodage\n";
+
+    auto envoyerLigne = [&](uint8_t pid, bool got, uint8_t* data, uint8_t len, uint8_t buf) {
+      String pid_str = String(pid, HEX); pid_str.toUpperCase();
+      String data_str = "-", info = "-";
+      String buf_str = got ? String(buf) : "-";
+      if (got) {
+        data_str = "";
+        for (int i = 0; i < len; i++) {
+          if (data[i] < 16) data_str += "0";
+          data_str += String(data[i], HEX) + " ";
+        }
+        data_str.toUpperCase(); data_str.trim();
+        if (len >= 4 && data[1] == 0x7F) info = "NEG NRC " + String(data[3], HEX);
+        else if (len >= 3 && data[1] == 0x41) info = decodePid(pid, data, len);
+        else info = "Brut";
+      }
+      csv_content += "0x" + pid_str + "," + (got ? "OUI" : "NON") + "," + buf_str + "," + data_str + "," + info + "\n";
+      String json = "{\"pid\":\"0x" + pid_str + "\",\"rep\":\"" + (got ? "OUI" : "NON") +
+                    "\",\"buf\":\"" + buf_str + "\",\"data\":\"" + data_str + "\",\"info\":\"" + info + "\"}";
+      client.print("data: " + json + "\n\n");
+      client.flush();
+    };
+
+    // Etape 1 : suivre la chaine d'index 0x00 -> 0x20 -> 0x40 -> ...
+    // Chaque reponse est un bitmap 32 bits : bits 31..1 = PID index+1..index+31
+    // supportes ou non, bit 0 = le groupe suivant existe (et double comme
+    // indicateur "PID index+32 supporte").
+    uint8_t pidsSupportes[256]; uint16_t nbSupportes = 0;
+    uint16_t indexPid = 0x00;
+
+    while (client.connected()) {
+      uint32_t respId; uint8_t data[8]; uint8_t len; uint8_t buf;
+      bool got = testerUnPid((uint8_t)indexPid, respId, data, len, buf);
+      envoyerLigne((uint8_t)indexPid, got, data, len, buf);
+
+      if (!got || len < 7 || data[1] != 0x41) break;   // chaine cassee, on s'arrete
+
+      uint32_t bitmap = ((uint32_t)data[3] << 24) | ((uint32_t)data[4] << 16) |
+                         ((uint32_t)data[5] << 8) | data[6];
+      bool continueChaine = bitmap & 0x01;
+
+      for (uint8_t i = 0; i < 31; i++) {
+        if (bitmap & (0x80000000UL >> i)) {
+          if (nbSupportes < 256) pidsSupportes[nbSupportes++] = (uint8_t)(indexPid + 1 + i);
         }
       }
 
-      if(rpmStable >= 4){
-        rpmStable = 0;
-        scanDebut(PH_SCAN_RUN, "SCAN RUN");
-      }else if((int32_t)(now - tR) >= 0){
-        tR = now + 250;
-        askOne(0x0C, ID29_FUNC);
-      }
-      break;
+      if (!continueChaine) break;
+      indexPid += 0x20;
+      if (indexPid > 0xFF) break;
     }
 
-    case PH_ACQ:
-      if((int32_t)(now - logNext) >= 0){
-        logTickAcq();
-        logNext = now + LOG_PERIOD_MS;
-      }
-      acqTick();
-      break;
-
-    default: break;
-  }
-}
-
-/* ============================================================
- * Requete ponctuelle bloquante
- * Reservee aux commandes interactives (DTC, PID) : elle vide le
- * bus a son propre compte et perturberait le tick. Refusee tant
- * que le journal tourne.
- * Retourne la longueur utile, 0 si pas de reponse.
- * ============================================================ */
-static uint16_t obdAsk(const uint8_t *req, uint8_t reqLen,
-                       uint8_t *rsp, uint16_t rspMax){
-  uint8_t f[8] = {0,0,0,0,0,0,0,0};
-  f[0] = reqLen;
-  for(uint8_t i=0;i<reqLen && i<7;i++) f[1+i] = req[i];
-  if(!canSend29(ID29_PHYS, f, 8)) return 0;
-  nTx++;
-
-  uint16_t total = 0, got = 0;
-  uint8_t  sn = 1;
-  uint32_t id; bool ext; uint8_t d[8];
-  uint32_t t0 = millis();
-
-  for(uint32_t g=0; g<500000 && millis() - t0 < 300; g++){
-    uint8_t n = canRecvAny(&id, &ext, d);
-    if(!n) continue;
-    if(!(ext && (id & 0xFFFFFF00UL) == 0x18DAF100UL)) continue;
-    uint8_t pci = d[0] >> 4;
-
-    if(pci == 0){
-      uint8_t len = d[0] & 0x0F;
-      if(len > 7) len = 7;
-      if(d[1] == 0x7F){
-        /* seul 7F xx 78 (reponse en attente) justifie de patienter */
-        if(len >= 3 && d[3] == 0x78){ t0 = millis(); continue; }
-        return 0;
-      }
-      if(len > rspMax) len = rspMax;
-      memcpy(rsp, d + 1, len);
-      return len;
+    // Etape 2 : n'interroger que les PID reellement annonces supportes
+    for (uint16_t i = 0; i < nbSupportes && client.connected(); i++) {
+      uint32_t respId; uint8_t data[8]; uint8_t len; uint8_t buf;
+      bool got = testerUnPid(pidsSupportes[i], respId, data, len, buf);
+      envoyerLigne(pidsSupportes[i], got, data, len, buf);
+      yield();
     }
-    if(pci == 1){
-      total = ((uint16_t)(d[0] & 0x0F) << 8) | d[1];
-      if(total > rspMax) total = rspMax;
-      got = 0;
-      for(uint8_t i=2;i<8 && got<total;i++) rsp[got++] = d[i];
-      canFc(id);
-      sn = 1;
-      t0 = millis();
+
+    // Ecriture sur LittleFS
+    File f = LittleFS.open("/result.csv", "w");
+    if (f) {
+      f.print(csv_content);
+      f.close();
     }
-    if(pci == 2 && total){
-      if((d[0] & 0x0F) != (sn & 0x0F)) return 0;
-      sn++;
-      for(uint8_t i=1;i<8 && got<total;i++) rsp[got++] = d[i];
-      t0 = millis();
-      if(got >= total) return total;
+
+    // Fin du stream
+    client.print("event: done\ndata: end\n\n");
+    client.flush();
+  });
+
+  server.on("/log_start", HTTP_GET, []() {
+    Serial.println("[DBG] /log_start recu");
+    if (logMode == LOG_IDLE) {
+      logFile = LittleFS.open("/drivelog.csv", "w");
+      if (logFile) logFile.println("t_ms,pid_hex,reponse,valeur_decodee,brut_hex");
+      logT0 = millis();
+      mancheDebutMs = millis();
+      pidIndex = 0;
+      pedalePrec = -1; vitessePrec = -1;
+      for (uint8_t i = 0; i < NB_MONITOR; i++) { derniereOk[i] = false; derniereVal[i] = "-"; derniereNum[i] = 0; }
+      logMode = LOG_NORMAL;
+      Serial.printf("[DBG] logMode=NORMAL, heap=%u\n", ESP.getFreeHeap());
     }
-  }
-  return 0;
-}
+    server.send(200, "text/plain", "OK");
+  });
 
-static bool interdit(){
-  if(logMode){
-    OUT->println("# occupe : journal en cours, faites LOG OFF");
-    return true;
-  }
-  if(!mcpOk){ OUT->println("# MCP2515 injoignable"); return true; }
-  return false;
-}
+  server.on("/log_stop", HTTP_GET, []() {
+    Serial.println("[DBG] /log_stop recu");   // si cette ligne n'apparait jamais -> la requete n'arrive meme pas au serveur
+    logMode = LOG_IDLE;   // la fermeture du fichier est differee au debut de loop()
+                          // (ce handler peut s'executer en pleine lecture PID)
+    server.send(200, "text/plain", "OK");
+    Serial.println("[DBG] /log_stop reponse envoyee");
+  });
 
-/* ============================================================
- * Libelles des codes defaut - SAE J2012 / ISO 15031-6
- * Sous-ensemble pertinent pour un diesel a rampe commune : les
- * familles allumage, sondes lambda et hybride sont ecartees,
- * elles ne peuvent pas apparaitre sur ce moteur. Un code absent
- * de la table est affiche seul, sans libelle.
- * ============================================================ */
-struct Dtc { uint16_t code; const char *txt; };
+  server.on("/log_status", HTTP_GET, []() {
+    size_t fsUsed = LittleFS.usedBytes();
+    size_t fsTotal = LittleFS.totalBytes();
+    float fsPct = fsTotal ? (100.0f * fsUsed / fsTotal) : 0;
 
-const Dtc DTCTXT[] PROGMEM = {
-  {0x0001,"Regulateur volume carburant - circuit ouvert"},
-  {0x0002,"Regulateur volume carburant - plage/performance"},
-  {0x0003,"Regulateur volume carburant - circuit trop bas"},
-  {0x0004,"Regulateur volume carburant - circuit trop haut"},
-  {0x0005,"Electrovanne coupure carburant - circuit ouvert"},
-  {0x0006,"Electrovanne coupure carburant - circuit trop bas"},
-  {0x0007,"Electrovanne coupure carburant - circuit trop haut"},
-  {0x0008,"Calage moteur ligne 1 - performance"},
-  {0x0016,"Vilebrequin/arbre a cames capteur A - correlation"},
-  {0x0017,"Vilebrequin/arbre a cames capteur B - correlation"},
-  {0x0033,"Electrovanne decharge turbo - panne du circuit"},
-  {0x0034,"Electrovanne decharge turbo - circuit trop bas"},
-  {0x0035,"Electrovanne decharge turbo - circuit trop haut"},
-  {0x0039,"Soupape derivation turbo - plage/performance"},
-  {0x0045,"Commande pression suralimentation - circuit ouvert"},
-  {0x0046,"Commande pression suralimentation - plage/performance"},
-  {0x0047,"Commande pression suralimentation - circuit trop bas"},
-  {0x0048,"Commande pression suralimentation - circuit trop haut"},
-  {0x0049,"Turbine turbo - regime excessif"},
-  {0x0068,"Correlation MAP / debitmetre / papillon"},
-  {0x0069,"Correlation MAP / pression atmospherique"},
-  {0x0070,"Sonde temperature exterieure - panne du circuit"},
-  {0x0071,"Sonde temperature exterieure - plage/performance"},
-  {0x0087,"Rampe commune / pression systeme trop faible"},
-  {0x0088,"Rampe commune / pression systeme trop haute"},
-  {0x0089,"Regulateur pression carburant - performance"},
-  {0x0090,"Electrovanne dosage carburant (IMV) - circuit ouvert"},
-  {0x0091,"Electrovanne dosage carburant (IMV) - c-c masse"},
-  {0x0092,"Electrovanne dosage carburant (IMV) - c-c alim"},
-  {0x0093,"Fuite circuit carburant - fuite importante"},
-  {0x0094,"Fuite circuit carburant - petite fuite"},
-  {0x0095,"Sonde temperature air admission 2 - circuit"},
-  {0x0100,"Debitmetre d'air - panne du circuit"},
-  {0x0101,"Debitmetre d'air - plage/performance"},
-  {0x0102,"Debitmetre d'air - valeur trop basse"},
-  {0x0103,"Debitmetre d'air - valeur trop haute"},
-  {0x0104,"Debitmetre d'air - circuit intermittent"},
-  {0x0105,"Capteur MAP/atmospherique - panne du circuit"},
-  {0x0106,"Capteur MAP/atmospherique - plage/performance"},
-  {0x0107,"Capteur MAP/atmospherique - valeur trop basse"},
-  {0x0108,"Capteur MAP/atmospherique - valeur trop haute"},
-  {0x0109,"Capteur MAP/atmospherique - circuit intermittent"},
-  {0x0110,"Sonde temperature air admission - circuit"},
-  {0x0111,"Sonde temperature air admission - plage/performance"},
-  {0x0112,"Sonde temperature air admission - valeur trop basse"},
-  {0x0113,"Sonde temperature air admission - valeur trop haute"},
-  {0x0114,"Sonde temperature air admission - intermittent"},
-  {0x0115,"Sonde temperature eau - panne du circuit"},
-  {0x0116,"Sonde temperature eau - plage/performance"},
-  {0x0117,"Sonde temperature eau - valeur trop basse"},
-  {0x0118,"Sonde temperature eau - valeur trop haute"},
-  {0x0119,"Sonde temperature eau - circuit intermittent"},
-  {0x0120,"Capteur pedale/papillon A - panne du circuit"},
-  {0x0121,"Capteur pedale/papillon A - plage/performance"},
-  {0x0122,"Capteur pedale/papillon A - valeur trop basse"},
-  {0x0123,"Capteur pedale/papillon A - valeur trop haute"},
-  {0x0124,"Capteur pedale/papillon A - circuit intermittent"},
-  {0x0128,"Thermostat - eau sous la temperature de regulation"},
-  {0x0148,"Erreur de debit de carburant"},
-  {0x0149,"Erreur de calage d'injection"},
-  {0x0168,"Temperature du carburant trop haute"},
-  {0x0180,"Sonde temperature carburant A - circuit"},
-  {0x0181,"Sonde temperature carburant A - plage/performance"},
-  {0x0182,"Sonde temperature carburant A - valeur trop basse"},
-  {0x0183,"Sonde temperature carburant A - valeur trop haute"},
-  {0x0190,"Capteur pression rampe - panne du circuit"},
-  {0x0191,"Capteur pression rampe - plage/performance"},
-  {0x0192,"Capteur pression rampe - valeur trop basse"},
-  {0x0193,"Capteur pression rampe - valeur trop haute"},
-  {0x0194,"Capteur pression rampe - circuit intermittent"},
-  {0x0195,"Sonde temperature huile moteur - circuit"},
-  {0x0200,"Injecteur - panne du circuit"},
-  {0x0201,"Injecteur 1 - panne du circuit"},
-  {0x0202,"Injecteur 2 - panne du circuit"},
-  {0x0203,"Injecteur 3 - panne du circuit"},
-  {0x0204,"Injecteur 4 - panne du circuit"},
-  {0x0215,"Electrovanne coupure carburant - panne du circuit"},
-  {0x0216,"Commande calage injection - panne du circuit"},
-  {0x0217,"Surchauffe du moteur"},
-  {0x0219,"Regime excessif"},
-  {0x0220,"Capteur pedale/papillon B - panne du circuit"},
-  {0x0221,"Capteur pedale/papillon B - plage/performance"},
-  {0x0222,"Capteur pedale/papillon B - valeur trop basse"},
-  {0x0223,"Capteur pedale/papillon B - valeur trop haute"},
-  {0x0224,"Capteur pedale/papillon B - circuit intermittent"},
-  {0x0230,"Pompe a carburant circuit primaire - panne"},
-  {0x0234,"Suralimentation - limite depassee"},
-  {0x0235,"Capteur pression turbo A - panne du circuit"},
-  {0x0236,"Capteur pression turbo A - plage/performance"},
-  {0x0237,"Capteur pression turbo A - valeur trop basse"},
-  {0x0238,"Capteur pression turbo A - valeur trop haute"},
-  {0x0243,"Electrovanne decharge turbo A - panne du circuit"},
-  {0x0245,"Electrovanne decharge turbo A - circuit trop bas"},
-  {0x0246,"Electrovanne decharge turbo A - circuit trop haut"},
-  {0x0251,"Pompe injection A rotor/cames - panne du circuit"},
-  {0x0252,"Pompe injection A rotor/cames - plage/performance"},
-  {0x0261,"Injecteur 1 - circuit trop bas"},
-  {0x0262,"Injecteur 1 - circuit trop haut"},
-  {0x0263,"Cylindre 1 - defaut d'equilibrage de debit"},
-  {0x0264,"Injecteur 2 - circuit trop bas"},
-  {0x0265,"Injecteur 2 - circuit trop haut"},
-  {0x0266,"Cylindre 2 - defaut d'equilibrage de debit"},
-  {0x0267,"Injecteur 3 - circuit trop bas"},
-  {0x0268,"Injecteur 3 - circuit trop haut"},
-  {0x0269,"Cylindre 3 - defaut d'equilibrage de debit"},
-  {0x0270,"Injecteur 4 - circuit trop bas"},
-  {0x0271,"Injecteur 4 - circuit trop haut"},
-  {0x0272,"Cylindre 4 - defaut d'equilibrage de debit"},
-  {0x0297,"Vitesse vehicule excessive"},
-  {0x0298,"Temperature huile moteur trop haute"},
-  {0x0299,"Turbo - pression de suralimentation faible"},
-  {0x0300,"Rates de combustion aleatoires"},
-  {0x0301,"Cylindre 1 - rates de combustion"},
-  {0x0302,"Cylindre 2 - rates de combustion"},
-  {0x0303,"Cylindre 3 - rates de combustion"},
-  {0x0304,"Cylindre 4 - rates de combustion"},
-  {0x0313,"Rates detectes avec niveau de carburant bas"},
-  {0x0315,"Position vilebrequin - variation non apprise"},
-  {0x0320,"Capteur vilebrequin/regime - panne du circuit"},
-  {0x0321,"Capteur vilebrequin/regime - plage/performance"},
-  {0x0322,"Capteur vilebrequin/regime - aucun signal"},
-  {0x0323,"Capteur vilebrequin/regime - intermittent"},
-  {0x0335,"Capteur vilebrequin - panne du circuit"},
-  {0x0336,"Capteur vilebrequin - plage/performance"},
-  {0x0337,"Capteur vilebrequin - valeur trop basse"},
-  {0x0338,"Capteur vilebrequin - valeur trop haute"},
-  {0x0339,"Capteur vilebrequin - circuit intermittent"},
-  {0x0340,"Capteur arbre a cames A - panne du circuit"},
-  {0x0341,"Capteur arbre a cames A - plage/performance"},
-  {0x0342,"Capteur arbre a cames A - valeur trop basse"},
-  {0x0343,"Capteur arbre a cames A - valeur trop haute"},
-  {0x0344,"Capteur arbre a cames A - circuit intermittent"},
-  {0x0380,"Bougies de prechauffage circuit A - panne"},
-  {0x0381,"Temoin bougies de prechauffage - circuit"},
-  {0x0382,"Bougies de prechauffage circuit B - panne"},
-  {0x0400,"Systeme EGR - probleme de debit"},
-  {0x0401,"Systeme EGR - debit insuffisant"},
-  {0x0402,"Systeme EGR - debit excessif"},
-  {0x0403,"Recyclage gaz echappement - panne du circuit"},
-  {0x0404,"Systeme EGR - plage/performance"},
-  {0x0405,"Capteur position vanne EGR A - valeur trop basse"},
-  {0x0406,"Capteur position vanne EGR A - valeur trop haute"},
-  {0x0409,"Capteur EGR A - panne du circuit"},
-  {0x0470,"Capteur pression gaz echappement - circuit"},
-  {0x0471,"Capteur pression gaz echappement - plage/perf"},
-  {0x0472,"Capteur pression gaz echappement - trop basse"},
-  {0x0473,"Capteur pression gaz echappement - trop haute"},
-  {0x0475,"Electrovanne pression echappement - circuit"},
-  {0x0480,"Motoventilateur refroidissement 1 - circuit"},
-  {0x0481,"Motoventilateur refroidissement 2 - circuit"},
-  {0x0486,"Capteur position vanne EGR B - panne du circuit"},
-  {0x0489,"Systeme EGR - circuit trop bas"},
-  {0x0490,"Systeme EGR - circuit trop haut"},
-  {0x0500,"Capteur vitesse vehicule - panne du circuit"},
-  {0x0501,"Capteur vitesse vehicule - plage/performance"},
-  {0x0502,"Capteur vitesse vehicule - valeur trop basse"},
-  {0x0503,"Capteur vitesse vehicule - intermittent/trop haute"},
-  {0x0504,"Contacteur de freinage - correlation A/B"},
-  {0x0520,"Capteur pression huile - panne du circuit"},
-  {0x0524,"Pression d'huile moteur trop basse"},
-  {0x0540,"Chauffage air admission A - panne du circuit"},
-  {0x0560,"Tension du systeme - panne"},
-  {0x0562,"Tension du systeme - basse"},
-  {0x0563,"Tension du systeme - haute"},
-  {0x0600,"Bus de donnees CAN - panne"},
-  {0x0601,"Calculateur moteur - erreur checksum memoire"},
-  {0x0602,"Calculateur moteur - erreur de programmation"},
-  {0x0603,"Calculateur moteur - erreur KAM"},
-  {0x0604,"Calculateur moteur - erreur RAM"},
-  {0x0605,"Calculateur moteur - erreur ROM"},
-  {0x0606,"Calculateur moteur - panne processeur"},
-  {0x0611,"Boitier injecteurs - probleme de performance"},
-  {0x0615,"Relais du demarreur - panne du circuit"},
-  {0x0627,"Commande pompe a carburant A - circuit ouvert"},
-  {0x0628,"Commande pompe a carburant A - circuit trop bas"},
-  {0x0629,"Commande pompe a carburant A - circuit trop haut"},
-  {0x0641,"Tension reference capteur A - circuit ouvert"},
-  {0x0651,"Tension reference capteur B - circuit ouvert"},
-  {0x0670,"Boitier bougies de prechauffage - circuit"},
-  {0x0671,"Bougie de prechauffage cylindre 1 - circuit"},
-  {0x0672,"Bougie de prechauffage cylindre 2 - circuit"},
-  {0x0673,"Bougie de prechauffage cylindre 3 - circuit"},
-  {0x0674,"Bougie de prechauffage cylindre 4 - circuit"},
-  {0x0685,"Relais alimentation calculateur - circuit ouvert"},
-  {0x0687,"Relais gestion moteur - court-circuit masse"},
-  {0x0688,"Relais gestion moteur - court-circuit alim"},
-  {0x0704,"Contacteur pedale embrayage - panne du circuit"},
-  {0x1000,"Code constructeur - voir documentation Fiat/PSA"}
-};
-#define NDTCTXT (sizeof(DTCTXT)/sizeof(DTCTXT[0]))
-
-/* rend le libelle, ou NULL. Ne cherche que dans la famille P0 :
-   les codes constructeur P1xxx ne sont pas normalises.         */
-static const char *dtcLibelle(uint8_t a, uint8_t b){
-  if((a >> 4) != 0x00) return NULL;          /* P0 uniquement */
-  uint16_t code = ((uint16_t)(a & 0x0F) << 8) | b;
-  for(uint16_t i=0;i<NDTCTXT;i++){
-    if(pgm_read_word(&DTCTXT[i].code) == code)
-      return (const char *)pgm_read_ptr(&DTCTXT[i].txt);
-  }
-  return NULL;
-}
-
-/* ============================================================
- * Codes defaut - modes 03 (memorises), 07 (en attente),
- * 0A (permanents, non effacables tant que le moniteur associe
- * n'a pas confirme la reparation).
- * ============================================================ */
-static void dtcNom(uint8_t a, uint8_t b, char *out){
-  const char L[4] = {'P','C','B','U'};
-  snprintf(out, 7, "%c%X%X%02X", L[(a >> 6) & 3], (a >> 4) & 3, a & 0x0F, b);
-}
-
-uint8_t cmdDtc(uint8_t mode){
-  if(interdit()) return 0;
-  uint8_t req[1] = { mode };
-  uint8_t rsp[TP_BUF];
-  uint16_t n = obdAsk(req, 1, rsp, sizeof(rsp));
-
-  const char *quoi = (mode == 0x03) ? "memorises"
-                   : (mode == 0x07) ? "en attente" : "permanents";
-
-  if(!n || rsp[0] != (uint8_t)(mode + 0x40)){
-    OUT->print("# "); OUT->print(quoi); OUT->println(" : pas de reponse");
-    return 0;
-  }
-  /* rsp : <mode+40> <nb> puis paires d'octets, ou directement
-     les paires selon les calculateurs. On saute l'octet de
-     comptage quand la longueur restante est impaire.          */
-  uint16_t k = 1;
-  if(((n - 1) & 1) == 1) k = 2;
-  uint8_t cnt = 0;
-  char code[8];
-  for(uint16_t g=0; g<128 && k + 1 < n; g++){
-    if(rsp[k] || rsp[k+1]){
-      dtcNom(rsp[k], rsp[k+1], code);
-      const char *t = dtcLibelle(rsp[k], rsp[k+1]);
-      OUT->print("# "); OUT->print(code);
-      if(t){ OUT->print("  "); OUT->print(t); }
-      OUT->println();
-      cnt++;
+    String json = "{\"mode\":\"" + String(logMode == LOG_IDLE ? "idle" : (logMode == LOG_RAFALE ? "rafale" : "normal")) +
+                  "\",\"rafale_restant_ms\":" + String(logMode == LOG_RAFALE ? (long)(rafaleFinMs - millis()) : 0) +
+                  ",\"fs_used\":" + String((unsigned long)fsUsed) + ",\"fs_total\":" + String((unsigned long)fsTotal) +
+                  ",\"fs_pct\":" + String(fsPct, 1) + ",\"pids\":[";
+    for (uint8_t i = 0; i < NB_MONITOR; i++) {
+      if (i) json += ",";
+      char pidhex[3]; sprintf(pidhex, "%02X", MONITOR_PIDS[i]);
+      json += "{\"pid\":\"0x" + String(pidhex) + "\",\"ok\":" + String(derniereOk[i] ? "true" : "false") +
+              ",\"num\":" + String(derniereNum[i], 2) + ",\"txt\":\"" + derniereVal[i] + "\"}";
     }
-    k += 2;
-  }
-  OUT->print("# "); OUT->print(quoi); OUT->print(" : "); OUT->println(cnt);
-  return cnt;
-}
+    json += "]}";
+    server.send(200, "application/json", json);
+  });
 
-/* ============================================================
- * Dictionnaire SAE J1979 - lecture a l'ecran uniquement
- * Le journal, lui, ecrit des octets bruts : ce dictionnaire ne
- * sert qu'a relire une PID a la console sans passer par le CSV.
- * ============================================================ */
-static void decodePid01(uint8_t pid, const uint8_t *v, uint8_t n){
-  float A = (n > 0) ? v[0] : 0;
-  float B = (n > 1) ? v[1] : 0;
-  uint16_t AB = ((uint16_t)(n>0?v[0]:0) << 8) | (n>1?v[1]:0);
+  server.on("/log_purge", HTTP_GET, []() {
+    if (logMode != LOG_IDLE) {
+      server.send(200, "application/json", "{\"ok\":false,\"raison\":\"log en cours\"}");
+      return;
+    }
+    bool removed = !LittleFS.exists("/drivelog.csv") || LittleFS.remove("/drivelog.csv");
+    server.send(200, "application/json", removed ? "{\"ok\":true}" : "{\"ok\":false,\"raison\":\"echec suppression\"}");
+  });
 
-  switch(pid){
-    case 0x04: OUT->print("charge moteur "); OUT->print(A*100/255,1); OUT->println(" %"); return;
-    case 0x05: OUT->print("temp eau ");      OUT->print(A-40,0);      OUT->println(" C"); return;
-    case 0x06: OUT->print("trim court B1 "); OUT->print(A*100/128-100,1); OUT->println(" %"); return;
-    case 0x07: OUT->print("trim long B1 ");  OUT->print(A*100/128-100,1); OUT->println(" %"); return;
-    case 0x0A: OUT->print("pression carb "); OUT->print(A*3,0);       OUT->println(" kPa"); return;
-    case 0x0B: OUT->print("MAP ");           OUT->print(A,0);         OUT->println(" kPa"); return;
-    case 0x0C: OUT->print("regime ");        OUT->print(AB/4.0f,0);   OUT->println(" tr/min"); return;
-    case 0x0D: OUT->print("vitesse ");       OUT->print(A,0);         OUT->println(" km/h"); return;
-    case 0x0E: OUT->print("avance ");        OUT->print(A/2-64,1);    OUT->println(" deg"); return;
-    case 0x0F: OUT->print("temp air adm ");  OUT->print(A-40,0);      OUT->println(" C"); return;
-    case 0x10: OUT->print("debit MAF ");     OUT->print(AB/100.0f,2); OUT->println(" g/s"); return;
-    case 0x11: OUT->print("papillon ");      OUT->print(A*100/255,1); OUT->println(" %"); return;
-    case 0x1F: OUT->print("temps depuis dem "); OUT->print(AB);       OUT->println(" s"); return;
-    case 0x21: OUT->print("km avec MIL ");   OUT->print(AB);          OUT->println(" km"); return;
-    case 0x22: OUT->print("rail rel vide "); OUT->print(AB*0.079f,1); OUT->println(" kPa"); return;
-    case 0x23: OUT->print("rail ");          OUT->print(AB*10.0f,0);  OUT->println(" kPa"); return;
-    case 0x2C: OUT->print("EGR commande ");  OUT->print(A*100/255,1); OUT->println(" %"); return;
-    case 0x2D: OUT->print("EGR erreur ");    OUT->print(A*100/128-100,1); OUT->println(" %"); return;
-    case 0x2E: OUT->print("purge canister ");OUT->print(A*100/255,1); OUT->println(" %"); return;
-    case 0x2F: OUT->print("niveau carb ");   OUT->print(A*100/255,1); OUT->println(" %"); return;
-    case 0x30: OUT->print("rearmements ");   OUT->println(A,0);       return;
-    case 0x31: OUT->print("km depuis effac ");OUT->print(AB);         OUT->println(" km"); return;
-    case 0x33: OUT->print("pression atmo "); OUT->print(A,0);         OUT->println(" kPa"); return;
-    case 0x3C: OUT->print("temp cata B1S1 ");OUT->print(AB/10.0f-40,1); OUT->println(" C"); return;
-    case 0x42: OUT->print("tension calc ");  OUT->print(AB/1000.0f,2);OUT->println(" V"); return;
-    case 0x43: OUT->print("charge absolue ");OUT->print(AB*100/255.0f,1); OUT->println(" %"); return;
-    case 0x44: OUT->print("lambda cmd ");    OUT->print(AB*2.0f/65536,3); OUT->println(""); return;
-    case 0x45: OUT->print("papillon rel ");  OUT->print(A*100/255,1); OUT->println(" %"); return;
-    case 0x46: OUT->print("temp ambiante "); OUT->print(A-40,0);      OUT->println(" C"); return;
-    case 0x47: OUT->print("papillon abs B ");OUT->print(A*100/255,1); OUT->println(" %"); return;
-    case 0x49: OUT->print("pedale D ");      OUT->print(A*100/255,1); OUT->println(" %"); return;
-    case 0x4A: OUT->print("pedale E ");      OUT->print(A*100/255,1); OUT->println(" %"); return;
-    case 0x4C: OUT->print("papillon cmd ");  OUT->print(A*100/255,1); OUT->println(" %"); return;
-    case 0x4D: OUT->print("duree MIL ");     OUT->print(AB);          OUT->println(" min"); return;
-    case 0x4E: OUT->print("duree depuis effac "); OUT->print(AB);     OUT->println(" min"); return;
-    case 0x5C: OUT->print("temp huile ");    OUT->print(A-40,0);      OUT->println(" C"); return;
-    case 0x5E: OUT->print("conso carb ");    OUT->print(AB*0.05f,2);  OUT->println(" L/h"); return;
-    case 0x5F: OUT->print("exigences emis ");OUT->println(A,0);       return;
-    case 0x62: OUT->print("couple relatif ");OUT->print(A-125,0);     OUT->println(" %"); return;
-    case 0x63: OUT->print("couple ref ");    OUT->print(AB);          OUT->println(" Nm"); return;
-    case 0x66: OUT->print("MAF capteur (multi-octets)"); OUT->println(); return;
-    case 0x69: OUT->print("EGR cmd/reel (multi-octets)"); OUT->println(); return;
-    case 0x6D: OUT->print("rail consigne ");
-               if(n >= 3){ OUT->print(((uint16_t)v[1]<<8|v[2])*10.0f,0); OUT->print(" kPa"); }
-               if(n >= 5){ OUT->print("  reel "); OUT->print(((uint16_t)v[3]<<8|v[4])*10.0f,0); OUT->print(" kPa"); }
-               if(n >= 6){ OUT->print("  temp "); OUT->print(v[5]-40); OUT->print(" C"); }
-               OUT->println(); return;
-    case 0x70: OUT->print("suralimentation (multi-octets)"); OUT->println(); return;
-    case 0x71: OUT->print("VGT cmd/reel (multi-octets)"); OUT->println(); return;
-    case 0x77: OUT->print("temp air apres echangeur (multi-octets)"); OUT->println(); return;
-    case 0x7A: OUT->print("delta P filtre a particules"); OUT->println(); return;
-    case 0x7C: OUT->print("temp FAP (multi-octets)"); OUT->println(); return;
-  }
-  (void)B;
-  OUT->println("(pas au dictionnaire)");
-}
+  server.on("/download_log", HTTP_GET, []() {
+    if (!LittleFS.exists("/drivelog.csv")) { server.send(404, "text/plain", "Pas de log"); return; }
+    File f = LittleFS.open("/drivelog.csv", "r");
+    server.sendHeader("Content-Disposition", "attachment; filename=nemo_drivelog.csv");
+    server.streamFile(f, "text/csv");
+    f.close();
+  });
 
-void cmdPid(const String &arg){
-  if(interdit()) return;
-  uint8_t pid = (uint8_t)strtoul(arg.c_str(), NULL, 16);
-  uint8_t req[2] = {0x01, pid};
-  uint8_t rsp[TP_BUF];
-  uint16_t n = obdAsk(req, 2, rsp, sizeof(rsp));
-
-  if(!n || rsp[0] != 0x41 || rsp[1] != pid){
-    OUT->print("# PID "); if(pid<16) OUT->print('0');
-    OUT->print(pid, HEX); OUT->println(" : pas de reponse");
-    return;
-  }
-  OUT->print("# PID "); if(pid<16) OUT->print('0');
-  OUT->print(pid, HEX); OUT->print(" RAW");
-  for(uint16_t i=2;i<n;i++){
-    OUT->print(' ');
-    if(rsp[i] < 16) OUT->print('0');
-    OUT->print(rsp[i], HEX);
-  }
-  OUT->println();
-  OUT->print("#   ");
-  decodePid01(pid, rsp + 2, n - 2);
-}
-
-/* ============================================================
- * Mode 02 - donnees gelees (freeze frame)
- * Instantane des parametres moteur fige a l'apparition du
- * defaut. C'est la seule photo de l'incident lui-meme, pas de
- * son contexte : elle dit a quel regime et sous quelle charge
- * la coupure s'est produite, sans avoir a etre en train de
- * journaliser au bon moment.
- * Requete : 02 <pid> <trame>, trame 00 = la seule memorisee sur
- * la plupart des calculateurs.
- * ============================================================ */
-void cmdFrz(){
-  if(interdit()) return;
-
-  /* PID 02 de la trame gelee : le DTC qui l'a declenchee */
-  uint8_t req[3] = {0x02, 0x02, 0x00};
-  uint8_t rsp[TP_BUF];
-  uint16_t n = obdAsk(req, 3, rsp, sizeof(rsp));
-  if(!n || rsp[0] != 0x42){
-    OUT->println("# pas de donnees gelees");
-    return;
-  }
-  if(n >= 5 && (rsp[3] || rsp[4])){
-    char code[8];
-    dtcNom(rsp[3], rsp[4], code);
-    OUT->print("# GEL declenche par "); OUT->println(code);
-  }else{
-    OUT->println("# GEL present, DTC declencheur non renseigne");
-  }
-
-  /* les parametres qui nous interessent dans la trame gelee */
-  static const uint8_t GEL[] = {0x04, 0x05, 0x0B, 0x0C, 0x0D, 0x0F,
-                                0x10, 0x11, 0x23, 0x2C, 0x2F, 0x33,
-                                0x42, 0x49, 0x5C, 0x6D};
-  for(uint8_t i=0;i<sizeof(GEL);i++){
-    uint8_t q[3] = {0x02, GEL[i], 0x00};
-    uint16_t m = obdAsk(q, 3, rsp, sizeof(rsp));
-    if(!m || rsp[0] != 0x42 || rsp[1] != GEL[i]) continue;
-    OUT->print("#   ");
-    if(GEL[i] < 16) OUT->print('0');
-    OUT->print(GEL[i], HEX);
-    OUT->print(' ');
-    decodePid01(GEL[i], rsp + 3, m - 3);   /* rsp: 42 <pid> <trame> <data> */
-  }
-}
-
-/* ============================================================
- * Tentative d'effacement - sequence recommandee
- * L'effacement seul ne prouve rien : un defaut reel revient des
- * que son moniteur re-tourne. La sequence releve donc l'etat
- * avant, efface, puis releve l'etat apres.
- *   1. lecture 03 / 07 / 0A et des donnees gelees, tout est
- *      ecrit dans le journal avant d'etre detruit
- *   2. mode 04
- *   3. relecture 03 / 07 / 0A
- * Un code encore present en 03 juste apres l'effacement est un
- * defaut actif, pas un residu. Un code permanent (0A) ne part
- * pas au mode 04, c'est normal : il faut que le moniteur
- * concerne tourne et confirme.
- * L'effacement est refuse moteur tournant par la plupart des
- * calculateurs : contact mis, moteur arrete.
- * ============================================================ */
-void cmdReset(){
-  if(interdit()) return;
-
-  OUT->println("# --- avant effacement ---");
-  logWriteTs("RESET DTC");
-  uint8_t a3 = cmdDtc(0x03);
-  uint8_t a7 = cmdDtc(0x07);
-  uint8_t aA = cmdDtc(0x0A);
-  if(a3) cmdFrz();
-
-  if(!a3 && !a7 && !aA){
-    OUT->println("# rien a effacer");
-    return;
-  }
-
-  uint8_t req[1] = {0x04};
-  uint8_t rsp[TP_BUF];
-  uint16_t n = obdAsk(req, 1, rsp, sizeof(rsp));
-  if(!n || rsp[0] != 0x44){
-    OUT->println("# effacement REFUSE (moteur tournant ?)");
-    return;
-  }
-  OUT->println("# efface");
-  delay(500);                       /* le calculateur reconstruit sa table */
-
-  OUT->println("# --- apres effacement ---");
-  uint8_t b3 = cmdDtc(0x03);
-  uint8_t b7 = cmdDtc(0x07);
-  uint8_t bA = cmdDtc(0x0A);
-
-  if(b3) OUT->println("# defaut ACTIF : revenu immediatement");
-  else if(bA) OUT->println("# permanents restants : moniteur a faire tourner");
-  else if(b7) OUT->println("# en attente restants : surveiller");
-  else OUT->println("# memoire propre");
-}
-
-/* ============================================================
- * Commandes
- * ============================================================ */
-void cmdHelp(){
-  OUT->println("# NEMO-OBD v" FW_VER);
-  OUT->println("# LOG ON / LOG OFF / LOG LAST / STAT?");
-  OUT->println("# ECHO ON / ECHO OFF");
-  OUT->println("# MARK     marqueur dans le journal");
-  OUT->println("# DTC      tous les codes : 03 + 07 + 0A");
-  OUT->println("# DTCP     en attente seuls / DTCX permanents seuls");
-  OUT->println("# FRZ      donnees gelees a l'apparition du defaut");
-  OUT->println("# RESET!   releve, efface, releve a nouveau");
-  OUT->println("# PID xx   lit une PID et la decode (journal a l'arret)");
-  OUT->println("# PURGE!   efface /log.csv");
-  OUT->println("# DOWNLOAD_DONE!   efface et redemarre");
-  OUT->println("# TIME! <epoch_s>");
-  OUT->println("# BUS?     compteurs de la pompe");
-}
-
-void cmdStat(){
-  OUT->print("# v"); OUT->print(FW_VER);
-  OUT->print(" phase "); OUT->print(phaseNom());
-  OUT->print(" lignes "); OUT->print(logLines);
-  OUT->print(" brutes "); OUT->print(brutN);
-  OUT->print(" flash "); OUT->print(LittleFS.usedBytes());
-  OUT->print("/"); OUT->println(LittleFS.totalBytes());
-}
-
-void cmdBus(){
-  OUT->print("# rx "); OUT->print(nRx);
-  OUT->print(" rsp "); OUT->print(nRsp);
-  OUT->print(" jetees "); OUT->print(nDrop);
-  OUT->print(" neg "); OUT->print(nNeg);
-  OUT->print(" tx "); OUT->print(nTx);
-  OUT->print(" EFLG 0x"); OUT->print(mcpRead(R_EFLG), HEX);
-  OUT->print(" TEC "); OUT->print(mcpRead(R_TEC));
-  OUT->print(" REC "); OUT->println(mcpRead(R_REC));
-}
-
-void execCmd(String c){
-  c.trim();
-  String u = c; u.toUpperCase();
-  if(!u.length()) return;
-
-  if(u == "LOG ON")   { logStart(false); return; }
-  if(u == "LOG OFF")  { logStop();       return; }
-  if(u == "LOG LAST") { OUT->println(logLastLine); return; }
-  if(u == "STAT?" || u == "LOG STAT"){ cmdStat(); return; }
-  if(u == "ECHO ON")  { logEcho = true;  OUT->println("# echo on");  return; }
-  if(u == "ECHO OFF") { logEcho = false; OUT->println("# echo off"); return; }
-  if(u == "PURGE!")   { logPurge(); return; }
-  if(u == "DOWNLOAD_DONE!"){ downloadDone(); return; }
-  if(u == "BUS?")     { cmdBus();   return; }
-  if(u == "DTC")      { cmdDtc(0x03); cmdDtc(0x07); cmdDtc(0x0A); return; }
-  if(u == "DTCP")     { cmdDtc(0x07); return; }
-  if(u == "DTCX")     { cmdDtc(0x0A); return; }
-  if(u == "FRZ")      { cmdFrz();  return; }
-  if(u == "RESET!")   { cmdReset(); return; }
-  if(u.startsWith("PID ")){ cmdPid(c.substring(4)); return; }
-  if(u == "HELP?")    { cmdHelp();  return; }
-  if(u.startsWith("TIME!")){
-    modEpoch   = (uint32_t)strtoul(c.c_str() + 5, NULL, 10);
-    modEpochMs = millis();
-    OUT->print("# horloge "); OUT->println(modEpoch);
-    return;
-  }
-  if(u.startsWith("MARK")){
-    char l[48];
-    snprintf(l, sizeof(l), "# MARK %u", ++markNum);
-    logWrite(l);
-    OUT->println(l);
-    return;
-  }
-  OUT->println("# ?");
-}
-
-/* ============================================================
- * Page web - HTML/CSS/JS pur, auto-contenue, aucun lien externe
- * ============================================================ */
-const char PAGE[] PROGMEM = R"HTML(<!DOCTYPE html><html lang="fr"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NEMO-OBD</title><style>
-*{box-sizing:border-box}body{margin:0;padding:10px;background:#111;color:#ddd;font:15px/1.3 system-ui,sans-serif}
-h1{font-size:18px;margin:0 0 7px;color:#7cf}.rel{font-size:11px;color:#777;font-weight:400;margin-left:6px}
-#status{background:#1a2632;border:1px solid #2d4356;border-radius:7px;padding:8px 10px;margin-bottom:8px;font-weight:600;color:#7cf;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.g{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:8px}.c{background:#1c1c1c;border:1px solid #333;border-radius:8px;padding:8px}
-.c:last-child{grid-column:1/-1}.n{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:.4px}.c .v{font-size:25px;font-weight:650;color:#7cf;margin-top:1px}
-.c.old .v{color:#555}.gb{height:6px;background:#252525;border-radius:4px;overflow:hidden;margin-top:5px}.gi{height:100%;width:0;background:#7cf;transition:width .25s}
-#fl{background:#1a2632;border:1px solid #2d4356;border-radius:7px;padding:8px 10px;margin-bottom:8px}
-#fll{display:flex;justify-content:space-between;font-size:12px;color:#9ab}#fln{color:#7cf;font-weight:600}
-#fb{height:10px;background:#222;border-radius:5px;margin-top:5px;overflow:hidden}#fbin{height:100%;width:0;background:#2e9e4f;transition:width .3s}
-#fbin.mid{background:#c8912a}#fbin.hot{background:#c03535}.b{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:7px}
-button{font:14px system-ui;padding:11px 5px;border:0;border-radius:7px;background:#2a3a4a;color:#cde}button:active{background:#3d5568}
-.off{background:#5c1e1e;color:#fcc}.on{background:#1e5c2e;color:#cfc}.dgr{background:#3a2020;color:#e99}.dgr.armed{background:#a01e1e;color:#fff;font-weight:700}
-#s{font:11px ui-monospace,monospace;color:#8a8;white-space:pre-wrap;background:#161616;border:1px solid #2a2a2a;border-radius:6px;padding:6px;min-height:24px}
-</style></head><body>
-<h1>NEMO-OBD <span class="rel">V6.3 — 05 SEP 2026</span></h1>
-<div id="status">PRET - appuyez sur START LOG</div>
-<div class="g" id="g"></div>
-<div id="fl"><div id="fll"><span>JOURNAL EN FLASH</span><span id="fln">--</span></div><div id="fb"><div id="fbin"></div></div></div>
-<div class="b">
-<button class="on" onclick="cmd('LOG ON')">START LOG</button>
-<button class="off" onclick="cmd('LOG OFF')">ARRET LOG</button>
-<button onclick="dl()">TELECHARGER CSV</button>
-<button onclick="cmd('DTC')">CHECK DEFAUTS</button>
-<button class="dgr" onclick="eff()">RESET DEFAUTS</button>
-<button class="dgr" id="pg" onclick="pur()">PURGE</button>
-</div>
-<div id="s">pret</div>
-<script>
-var NOM=["compte tours tr/min","vitesse km/h","pedale %","pression rail kPa","MAP / turbo kPa"],MAX=[7000,250,100,200000,300],g=document.getElementById("g");
-for(var i=0;i<NOM.length;i++)g.innerHTML+='<div class="c old" id="c'+i+'"><div class="n">'+NOM[i]+'</div><div class="v">--</div><div class="gb"><div class="gi"></div></div></div>';
-function cmd(c){fetch("/cmd?c="+encodeURIComponent(c)).then(function(r){return r.text()}).then(function(t){document.getElementById("s").textContent=t;maj()})}
-function dl(){var s=document.getElementById("s");s.textContent="telechargement...";
-fetch("/log.csv",{cache:"no-store"}).then(function(r){if(!r.ok)throw 0;return r.blob()}).then(function(b){if(!b.size)throw 0;var u=URL.createObjectURL(b),a=document.createElement("a");
-a.href=u;a.download="log_nemo.csv";document.body.appendChild(a);a.click();document.body.removeChild(a);setTimeout(function(){URL.revokeObjectURL(u)},60000);cmd("DOWNLOAD_DONE!")})
-.catch(function(){s.textContent="# echec telechargement - journal conserve"})}
-var pb=null;function pur(){var b=document.getElementById("pg");if(pb){clearTimeout(pb);pb=null;b.textContent="PURGE";b.classList.remove("armed");cmd("PURGE!");return}
-b.textContent="EFFACER ?";b.classList.add("armed");pb=setTimeout(function(){pb=null;b.textContent="PURGE";b.classList.remove("armed")},4000)}
-var eb=null;function eff(){var b=document.querySelector(".dgr");if(eb){clearTimeout(eb);eb=null;b.textContent="RESET DEFAUTS";b.classList.remove("armed");document.getElementById("s").textContent="sequence en cours...";cmd("RESET!");return}
-b.textContent="CONFIRMER ?";b.classList.add("armed");eb=setTimeout(function(){eb=null;b.textContent="RESET DEFAUTS";b.classList.remove("armed")},4000)}
-function maj(){fetch("/stat",{cache:"no-store"}).then(function(r){return r.json()}).then(function(j){
-document.getElementById("status").textContent=j.status;
-var fp=j.tot?(j.use*100/j.tot):0,fi=document.getElementById("fbin");fi.style.width=fp.toFixed(1)+"%";fi.className=(fp>=90)?"hot":((fp>=70)?"mid":"");
-document.getElementById("fln").textContent=(j.use/1024).toFixed(1)+" ko / "+(j.tot/1024).toFixed(0)+" ko ("+fp.toFixed(1)+"%) — "+j.n+" lignes"+(j.plein?" — PLEINE":"");
-for(var i=0;i<NOM.length;i++){var c=document.getElementById("c"+i),v=j.val[i],x=c.querySelector(".v"),gi=c.querySelector(".gi");x.textContent=(v===null)?"--":v;c.className="c"+(j.frais[i]?"":" old");gi.style.width=(v===null||!MAX[i])?"0%":Math.min(100,Math.max(0,Math.abs(v)*100/MAX[i]))+"%";}
-}).catch(function(){})}
-fetch("/cmd?c="+encodeURIComponent("TIME! "+Math.floor(Date.now()/1000)));setInterval(maj,500);maj();
-</script></body></html>)HTML";
-
-void handleRoot(){
-  server.sendHeader("Cache-Control", "no-store");
-  server.send_P(200, "text/html", PAGE);
-}
-
-void handleCmd(){
-  String c = server.arg("c");
-  StreamString ss;
-  OUT = &ss;
-  execCmd(c);
-  OUT = &Serial;
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "text/plain", (const String&)ss);
-}
-
-void handleStat(){
-  String j = "{\"fw\":\"" FW_VER "\",\"ph\":";    j += (int)phase;
-  j += ",\"phase\":\""; j += phaseNom(); j += "\"";
-  j += ",\"status\":\""; j += uiStatus; j += "\"";
-  j += "\",\"scan\":";  j += (scanEtape == 0) ? adrPid : scanPid;
-  j += ",\"etape\":";   j += scanEtape;
-  j += ",\"adrn\":";    j += adrN;
-  j += ",\"adri\":";    j += adrIdx;
-  j += ",\"brut\":";    j += brutN;
-  j += ",\"n\":";       j += logLines;
-  j += ",\"use\":";     j += (uint32_t)LittleFS.usedBytes();
-  j += ",\"tot\":";     j += (uint32_t)LittleFS.totalBytes();
-  j += ",\"log\":";     j += logMode ? "true" : "false";
-  j += ",\"plein\":";   j += logPlein ? "true" : "false";
-  j += ",\"tx\":";       j += nTx;
-  j += ",\"rx\":";       j += nRx;
-  j += ",\"rsp\":";      j += nRsp;
-  j += ",\"drop\":";     j += nDrop;
-  j += ",\"neg\":";      j += nNeg;
-  j += ",\"nrc78\":";    j += nNrc78;
-  j += ",\"nrc21\":";    j += nNrc21;
-  j += ",\"nrcOther\":"; j += nNrcOther;
-  j += ",\"late\":";     j += acqLateRsp;
-  j += ",\"rspa\":";     j += acqRspTotal;
-  j += ",\"eflg\":";     j += mcpOk ? mcpRead(R_EFLG) : 0;
-  j += ",\"txctrl\":";   j += mcpOk ? mcpRead(R_TXB0CTRL) : 0;
-  j += ",\"cadence_ms\":"; j += LOG_PERIOD_MS;
-  j += ",\"wait\":";     j += (phase == PH_SCAN_OFF || phase == PH_SCAN_RUN)
-                              ? (uint32_t)((int32_t)(scanDeadline - millis()) > 0
-                                  ? scanDeadline - millis() : 0)
-                              : 0;
-  j += ",\"val\":[";
-  for(uint8_t i=0;i<NCOL;i++){
-    if(i) j += ",";
-    if(!cellSeen[i]) j += "null";
-    else j += String(cellShow[i], (COL[i].step >= 1.0f) ? 0 : 1);
-  }
-  j += "],\"frais\":[";
-  for(uint8_t i=0;i<NCOL;i++){
-    if(i) j += ",";
-    j += cellMs[i] ? "true" : "false";
-  }
-  j += "]}";
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", j);
-}
-
-void handleLogCsv(){
-  if(logFile) logFile.flush();
-  File f = LittleFS.open(LOG_FICH, "r");
-  if(!f){ server.send(404, "text/plain", "# pas de journal"); return; }
-  server.sendHeader("Content-Disposition", "attachment; filename=log_nemo.csv");
-  server.streamFile(f, "text/csv");
-  f.close();
-}
-
-/* ============================================================
- * Setup / boucle
- * ============================================================ */
-void setup(){
-  pinMode(PIN_CS, OUTPUT); csH();
-  pinMode(PIN_INT, INPUT_PULLUP);
-  Serial.begin(115200);
-  delay(300);
-
-  Serial.println("# obd_can_bridge v" FW_VER " - Eric Perret F1OCM");
-  Serial.println("# Nemo 1.3 HDi - Marelli MJD 8F3.F6 - ISO 15765-4 29 bits");
-
-  SPI.begin();
-  /* 10 MHz : maximum MCP2515. En dessous la pompe ne suit pas. */
-  SPI.beginTransaction(SPISettings(10000000, MSBFIRST, SPI_MODE0));
-
-  mcpOk = mcpInit();
-  Serial.println(mcpOk ? "# MCP2515 pret" : "# MCP2515 injoignable - retry auto");
-
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, mcpOk ? LOW : HIGH);
-
-  logFs = LittleFS.begin(true);
-  Serial.println("# acquisition v6 : mode fixe / haute cadence");
-
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(AP_IP, AP_IP, AP_MASK);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  server.on("/",        handleRoot);
-  server.on("/cmd",     handleCmd);
-  server.on("/stat",    handleStat);
-  server.on("/log.csv", handleLogCsv);
   server.begin();
-  Serial.print("# WiFi " AP_SSID " (" AP_PASS ") -> http://");
-  Serial.println(WiFi.softAPIP());
-
-  if(logFs && LittleFS.exists(LOG_FLAG)){
-    Serial.println("# session interrompue : reprise");
-    logStart(true);
-  }
-  cmdHelp();
 }
 
-String line;
-
-void loop(){
+void loop() {
   server.handleClient();
 
-  static uint32_t tRetry = 0;
-  if(!mcpOk && millis() - tRetry >= 300){
-    tRetry = millis();
-    mcpOk = mcpInit();
-    if(mcpOk){
-      digitalWrite(LED_BUILTIN, LOW);
-      Serial.println("# MCP2515 accroche");
+  if (logMode == LOG_IDLE) {
+    if (logFile) {
+      Serial.println("[DBG] LOG_IDLE detecte dans loop() -> fermeture fichier");
+      if (logBuffer.length()) { logFile.print(logBuffer); logBuffer = ""; }
+      logFile.close();   // fermeture differee (voir /log_stop)
+      Serial.println("[DBG] fichier ferme");
+    }
+    return;
+  }
+
+  uint8_t pid = MONITOR_PIDS[pidIndex];
+  Serial.printf("[DBG] round pid=0x%02X idx=%u mode=%d heap=%u t=%lu\n",
+                pid, pidIndex, (int)logMode, ESP.getFreeHeap(), millis());
+
+  uint32_t respId; uint8_t data[8]; uint8_t len; uint8_t buf;
+  uint32_t tAvant = millis();
+  bool got = testerUnPid(pid, respId, data, len, buf);
+  uint32_t dureeAppel = millis() - tAvant;
+  if (dureeAppel > PID_TIMEOUT_MS + 20) {
+    Serial.printf("[DBG] !! testerUnPid a dure %lums (attendu ~%dms)\n", dureeAppel, PID_TIMEOUT_MS);
+  }
+
+  uint32_t t = millis() - logT0;
+  String valTxt = "-"; String rawHex = "-"; float num = 0; bool numOk = false;
+
+  if (got) {
+    rawHex = "";
+    for (int i = 0; i < len; i++) {
+      char b[3]; sprintf(b, "%02X", data[i]);
+      rawHex += b; if (i < len - 1) rawHex += " ";
+    }
+    if (len >= 3 && data[1] == 0x41) {
+      valTxt = decodePid(pid, data, len);
+      numOk = getNumeric(pid, data, len, num);
+    } else if (len >= 4 && data[1] == 0x7F) {
+      valTxt = "NEG NRC " + String(data[3], HEX);
+    } else {
+      valTxt = "Brut";
     }
   }
 
-  canPump();        /* on lit ce qui arrive, a chaque tour */
-  sessionTick();    /* on ecrit et on redemande, a l'heure */
-  yield();          /* laisse la pile WiFi respirer */
+  // Maj des dernieres valeurs (jauges)
+  derniereOk[pidIndex] = got;
+  derniereVal[pidIndex] = valTxt;
+  if (numOk) derniereNum[pidIndex] = num;
 
-  for(uint16_t g=0; g<256 && Serial.available(); g++){
-    char c = Serial.read();
-    if(c == '\r') continue;
-    if(c != '\n'){ line += c; if(line.length() > 60) line = ""; continue; }
-    execCmd(line);
-    line = "";
+  // Ligne accumulee en RAM (pas d'ecriture flash ici, voir plus bas)
+  char pidhex[3]; sprintf(pidhex, "%02X", pid);
+  logBuffer += String(t) + ",0x" + pidhex + "," + (got ? "OUI" : "NON") + "," + valTxt + "," + rawHex + "\n";
+
+  // Detection perte de puissance : pedale (index 0) puis vitesse (index 1),
+  // adjacentes dans MONITOR_PIDS pour un ecart temporel minimal entre les deux.
+  if (pidIndex == IDX_VITESSE && numOk && derniereOk[IDX_PEDALE]) {
+    float pedaleNow = derniereNum[IDX_PEDALE];
+    float vitesseNow = num;
+    if (pedalePrec >= 0 && vitessePrec >= 0 && logMode != LOG_RAFALE) {
+      bool motif = (pedaleNow > pedalePrec && vitesseNow < vitessePrec) || (pedaleNow > SEUIL_PEDALE_PCT);
+      if (motif) {
+        Serial.println("[DBG] RAFALE declenchee");
+        logMode = LOG_RAFALE;
+        rafaleFinMs = millis() + DUREE_RAFALE_MS;
+      }
+    }
+    pedalePrec = pedaleNow;
+    vitessePrec = vitesseNow;
+  }
+
+  pidIndex++;
+  if (pidIndex >= NB_MONITOR) {
+    pidIndex = 0;
+    if (logMode == LOG_RAFALE && millis() > rafaleFinMs) {
+      Serial.println("[DBG] fin RAFALE -> NORMAL");
+      logMode = LOG_NORMAL;
+    }
+    Serial.printf("[DBG] fin manche mode=%d bufferLen=%u heap=%u\n", (int)logMode, logBuffer.length(), ESP.getFreeHeap());
+
+    if (logMode == LOG_NORMAL) {
+      // Cadence ~1 Hz : on complete la manche jusqu'a la seconde pleine
+      uint32_t ecoule = millis() - mancheDebutMs;
+      if (ecoule < DUREE_MANCHE_NORMALE_MS) delay(DUREE_MANCHE_NORMALE_MS - ecoule);
+      mancheDebutMs = millis();
+
+      // Ecriture flash uniquement ici (jamais en rafale), espacee dans le temps :
+      // une ecriture flash peut bloquer le WiFi le temps de l'operation, donc on
+      // la limite en frequence plutot que d'ecrire a chaque manche.
+      if (logFile && millis() - derniereEcritureMs >= FLUSH_INTERVAL_MS && logBuffer.length()) {
+        Serial.println("[DBG] ecriture flash en cours...");
+        uint32_t tFlush = millis();
+        logFile.print(logBuffer);
+        logFile.flush();
+        logBuffer = "";
+        derniereEcritureMs = millis();
+        Serial.printf("[DBG] ecriture flash OK (%lums)\n", millis() - tFlush);
+      }
+    } else {
+      // Rafale : pause courte entre manches (stabilite avant vitesse), aucune
+      // ecriture flash tant que la rafale dure - le tampon RAM absorbe tout.
+      delay(RAFALE_PAUSE_MS);
+    }
   }
 }
