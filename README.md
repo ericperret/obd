@@ -109,14 +109,18 @@ Une instrumentation de debug (`Serial.print`, 115200 bauds) reste en place dans 
 
 ## Compilation
 
+./obd_build.sh flash ( puis ./obd_build.sh mon )
+
+ou
 ```bash
 arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3 obd_can_bridge.ino
 arduino-cli upload  --fqbn esp32:esp32:XIAO_ESP32S3 -p /dev/ttyACM0 obd_can_bridge.ino
 ```
 
+
 Aucune bibliothèque tierce à installer.
 
-## Reste à faire
+## Reste à faire ( fait en 8.11, a tester... )
 
 - Décodage niveau 2 (PID à bits énumérés : `0x01`, `0x1C`, `0x41`, etc.)
 - Bouton **CLEAR** (Mode 04 — effacement défauts), validé faisable, pas encore codé. Attention : réinitialise aussi les moniteurs de conformité ("readiness"), nécessite un cycle de conduite complet pour redevenir "prêt".
