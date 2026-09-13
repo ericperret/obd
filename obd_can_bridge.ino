@@ -7,7 +7,7 @@
 #include <FS.h>
 #include <LittleFS.h>
 
-#define FW_VER "8.13"
+#define FW_VER "8.17"
 
 /* ---------- WiFi point d'acces ------------------------------ */
 #define AP_SSID   "NEMO-OBD"
@@ -61,6 +61,7 @@ const uint8_t MONITOR_PIDS[] = {0x49, 0x0D, 0x0C, 0x04, 0x10, 0x0B, 0x23, 0x2C, 
 #define NB_MONITOR (sizeof(MONITOR_PIDS)/sizeof(MONITOR_PIDS[0]))
 #define IDX_PEDALE 0   // position de 0x49 dans MONITOR_PIDS
 #define IDX_VITESSE 1  // position de 0x0D dans MONITOR_PIDS
+#define IDX_REGIME 2   // position de 0x0C dans MONITOR_PIDS
 #define SEUIL_PEDALE_PCT 75.0f
 #define DUREE_RAFALE_MS 15000UL
 #define DUREE_MANCHE_NORMALE_MS 1000UL
@@ -311,6 +312,25 @@ String decodeStatutMoniteurs(uint8_t* data, bool cyclActuel) {
   return out;
 }
 
+/* ---------- Estimation du rapport engage (source RTA, pneu exact
+ * 185/65 R15 monte sur ce Nemo). La tolerance ci-dessous absorbe la
+ * marge normale (usure, gonflage) sans qu'il soit besoin de deviner
+ * une taille de pneu differente. ------------------------------------- */
+const float VITESSE_A_1000RPM[6] = {0, 8.16f, 14.25f, 22.09f, 31.00f, 41.59f};  // index 1..5
+#define RAPPORT_TOLERANCE 0.15f   // 15% d'ecart max, sinon embrayage/point mort/roue folle
+
+uint8_t estimerRapport(float rpm, float vitesse) {
+  if (rpm < 500 || vitesse < 3) return 0;   // moteur au ralenti ou vehicule a l'arret
+  uint8_t meilleur = 0;
+  float meilleurEcart = 999;
+  for (uint8_t g = 1; g <= 5; g++) {
+    float attendue = (rpm / 1000.0f) * VITESSE_A_1000RPM[g];
+    float ecart = attendue > vitesse ? (attendue - vitesse) / attendue : (vitesse - attendue) / attendue;
+    if (ecart < meilleurEcart) { meilleurEcart = ecart; meilleur = g; }
+  }
+  return (meilleurEcart <= RAPPORT_TOLERANCE) ? meilleur : 0;
+}
+
 String decodePid(uint8_t pid, uint8_t* data, uint8_t len) {
   String out = "";
   bool found = false;
@@ -367,7 +387,7 @@ bool getNumeric(uint8_t pid, uint8_t* data, uint8_t len, float &out) {
 
 /* ---------- Fonction dediee : test d'un seul PID connu ------- */
 /* ---------- Etat du log continu ------------------------------ */
-enum LogMode { LOG_IDLE, LOG_NORMAL, LOG_RAFALE };
+enum LogMode { LOG_IDLE, LOG_NORMAL, LOG_RAFALE, LOG_CONDUITE };
 LogMode  logMode = LOG_IDLE;
 uint32_t logT0 = 0;            // debut du log (horodatage relatif)
 uint32_t rafaleFinMs = 0;
@@ -375,10 +395,18 @@ uint32_t mancheDebutMs = 0;
 uint8_t  pidIndex = 0;
 
 float   pedalePrec = -1, vitessePrec = -1;
+uint8_t rapportEstime = 0;   // 0 = indetermine, 1-5 = rapport (fige pendant LOG_CONDUITE)
 bool    derniereOk[NB_MONITOR];
 String  derniereVal[NB_MONITOR];   // texte decode, pour les jauges
 float   derniereNum[NB_MONITOR];   // valeur numerique, pour les jauges
 File    logFile;
+
+/* ---------- Mode Conduite : RPM en boucle, rien d'autre --------------- */
+float   rpmConduite = 0;
+bool    rpmConduiteOk = false;
+float   vitesseConduite = 0;
+bool    vitesseConduiteOk = false;
+uint8_t conduitePhase = 0;   // 0=RPM, 1=vitesse, alterne a chaque appel
 
 /* ---------- Niveau 2 : etat -------------------------------------------- */
 String   normeObd = "-";           // 0x1C, interroge une seule fois au demarrage
@@ -1520,13 +1548,223 @@ String listerDTC(uint8_t* data, uint8_t len) {
   return out.length() ? out : "Aucun";
 }
 
+/* ---------- HTML Accueil ------------------------------------- */
+const char* HTML_ACCUEIL = R"rawliteral(
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEMO OBD</title>
+<style>
+body { font-family: Arial, sans-serif; text-align: center; background: #000; color: #fff; padding: 50px 20px; }
+h1 { font-size: 1.3em; }
+p { color: #ccc; }
+a.bouton { display: block; margin: 24px auto; padding: 26px; max-width: 320px; font-size: 22px;
+  font-weight: bold; border-radius: 12px; text-decoration: none; color: #fff; }
+.diag { background: #007bff; }
+.conduite { background: #2ecc71; }
+</style></head><body>
+<h1>NEMO OBD</h1>
+<p>Citroen Nemo 1.3 HDi - Marelli MJD 8F3.F6</p>
+<a class="bouton diag" href="/diag">DIAGNOSTIC</a>
+<a class="bouton conduite" href="/conduite">CONDUITE</a>
+</body></html>
+)rawliteral";
+
+/* ---------- HTML Conduite (jauge RPM 270 deg plein ecran) ----- */
+const char* HTML_CONDUITE = R"rawliteral(
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NEMO Conduite</title>
+<style>
+body { font-family: Arial, sans-serif; text-align: center; background: #000; color: #fff; margin: 0; padding: 16px; }
+h1 { font-size: 1.1em; margin: 4px 0 12px; }
+button { padding: 10px 18px; font-size: 15px; font-weight: bold; border: none; border-radius: 8px; color: #fff; margin: 3px; }
+#gaugeWrap { width: 92vw; max-width: 480px; margin: 10px auto; }
+#gaugeWrap svg { width: 100%; height: auto; }
+#rpmVal { font-size: 15vw; font-weight: bold; margin-top: -12vw; }
+#rpmUnit { font-size: 1em; color: #aaa; margin-bottom: 10px; }
+#retour { display: inline-block; margin-top: 14px; padding: 12px 24px; background: #555; color: #fff;
+  text-decoration: none; border-radius: 8px; }
+</style></head><body>
+<h1>Mode conduite</h1>
+<div>
+  <button id="btnEcoC" onclick="choisirModeC('eco')" style="background:#2ecc71;">ECO</button>
+  <button id="btnNormalC" onclick="choisirModeC('normal')" style="background:#555;">NORMAL</button>
+  <button id="btnPerfC" onclick="choisirModeC('perf')" style="background:#555;">PERFORMANCE</button>
+</div>
+<div id="gaugeWrap"></div>
+<div id="rpmVal">--</div>
+<div id="rpmUnit">tr/min</div>
+<div id="rapportZone" style="display:flex;justify-content:center;align-items:center;gap:20px;margin-top:10px;">
+  <div>
+    <div style="font-size:12px;color:#888;">RAPPORT</div>
+    <div id="rapportActuel" style="font-size:20vw;font-weight:bold;line-height:1;">-</div>
+  </div>
+  <div id="rapportSuivant" style="font-size:16vw;font-weight:bold;line-height:1;">-</div>
+</div>
+<a id="retour" href="#" onclick="retourAccueil(); return false;">Retour</a>
+
+<script>
+var RAYON = 45, CIRC = 2 * Math.PI * RAYON, ARC_DEG = 270, ARC_LEN = CIRC * (ARC_DEG / 360);
+var RPM_MAX = 5000;
+var ANGLE0 = 150;   // meme convention que les jauges diag : depart a 8h
+var MODES = { eco: {bas:1400,haut:2200}, normal: {bas:1800,haut:2600}, perf: {bas:2700,haut:3900} };
+var modeActuel = 'eco';
+var dernierRapport = 0;
+
+function zoneArc(startFrac, lenFrac, couleur) {
+  if (lenFrac <= 0) return '';
+  var startAngle = ANGLE0 + startFrac * ARC_DEG;
+  var len = ARC_LEN * lenFrac;
+  return '<circle cx="50" cy="50" r="' + RAYON + '" fill="none" stroke="' + couleur + '" stroke-width="10" ' +
+    'stroke-dasharray="' + len + ' ' + (CIRC - len) + '" transform="rotate(' + startAngle + ' 50 50)"/>';
+}
+
+function dessinerGauge() {
+  var m = MODES[modeActuel];
+  var bas = (dernierRapport === 1) ? 0 : m.bas;   // pas de retrograder en 1ere
+  var haut = m.haut;
+  var svg = '<svg viewBox="0 0 100 100">' +
+    '<circle cx="50" cy="50" r="' + RAYON + '" fill="none" stroke="#222" stroke-width="10" ' +
+      'stroke-dasharray="' + ARC_LEN + ' ' + (CIRC - ARC_LEN) + '" transform="rotate(' + ANGLE0 + ' 50 50)"/>' +
+    zoneArc(0, bas / RPM_MAX, '#00e5ff') +
+    zoneArc(bas / RPM_MAX, (haut - bas) / RPM_MAX, '#2ecc71') +
+    zoneArc(haut / RPM_MAX, (RPM_MAX - haut) / RPM_MAX, '#e74c3c') +
+    '<line id="aiguille" x1="50" y1="50" x2="88" y2="50" stroke="#fff" stroke-width="3" stroke-linecap="round"/>' +
+    '</svg>';
+  document.getElementById('gaugeWrap').innerHTML = svg;
+}
+
+function majAiguille(rpm) {
+  var frac = Math.max(0, Math.min(1, rpm / RPM_MAX));
+  var angle = ANGLE0 + frac * ARC_DEG;
+  var a = document.getElementById('aiguille');
+  if (a) a.setAttribute('transform', 'rotate(' + angle + ' 50 50)');
+}
+
+function choisirModeC(m) {
+  modeActuel = m;
+  document.getElementById('btnEcoC').style.background = (m === 'eco') ? '#2ecc71' : '#555';
+  document.getElementById('btnNormalC').style.background = (m === 'normal') ? '#2ecc71' : '#555';
+  document.getElementById('btnPerfC').style.background = (m === 'perf') ? '#2ecc71' : '#555';
+  dessinerGauge();
+}
+
+var audioCtx = null;
+function ctxAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+function biper(freq, dureeMs) {
+  var ctx = ctxAudio();
+  var osc = ctx.createOscillator(), gain = ctx.createGain();
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.15, ctx.currentTime);
+  osc.connect(gain); gain.connect(ctx.destination);
+  osc.start(); osc.stop(ctx.currentTime + dureeMs / 1000);
+}
+var oscContinuNode = null;
+function toneContinueDemarrer(freq) {
+  if (oscContinuNode) return;
+  var ctx = ctxAudio();
+  var osc = ctx.createOscillator(), gain = ctx.createGain();
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.12, ctx.currentTime);
+  osc.connect(gain); gain.connect(ctx.destination);
+  osc.start();
+  oscContinuNode = osc;
+}
+function toneContinueArreter() {
+  if (oscContinuNode) { oscContinuNode.stop(); oscContinuNode = null; }
+}
+
+var dernierRpm = 0;
+function boucleAudioC() {
+  var delaiSuivant = 300;
+  if (modeActuel !== 'perf') {
+    toneContinueArreter();
+  } else {
+    var m = MODES.perf, rpm = dernierRpm;
+    if (rpm >= m.haut) {
+      toneContinueDemarrer(1200);
+    } else if (rpm >= m.haut - 500) {
+      toneContinueArreter();
+      biper(1200, 70);
+      delaiSuivant = 550 - ((rpm - (m.haut - 500)) / 500) * 450;
+    } else if (rpm > 0 && rpm <= m.bas) {
+      toneContinueDemarrer(300);
+    } else if (rpm <= m.bas + 500) {
+      toneContinueArreter();
+      biper(300, 70);
+      delaiSuivant = 550 - (((m.bas + 500) - rpm) / 500) * 450;
+    } else {
+      toneContinueArreter();
+    }
+  }
+  setTimeout(boucleAudioC, delaiSuivant);
+}
+
+var pollTimer = null;
+function majRapportAffiche() {
+  var actuelEl = document.getElementById('rapportActuel');
+  var suivantEl = document.getElementById('rapportSuivant');
+  if (dernierRapport === 0) {
+    actuelEl.textContent = '-';
+    suivantEl.textContent = '';
+    return;
+  }
+  actuelEl.textContent = dernierRapport;
+  var m = MODES[modeActuel];
+  var basApplicable = (dernierRapport > 1);   // pas de retrograder en 1ere
+  if (dernierRpm > m.haut && dernierRapport < 5) {
+    suivantEl.textContent = '\u2191 ' + (dernierRapport + 1);
+    suivantEl.style.color = '#e74c3c';
+  } else if (basApplicable && dernierRpm < m.bas) {
+    suivantEl.textContent = '\u2193 ' + (dernierRapport - 1);
+    suivantEl.style.color = '#00e5ff';
+  } else {
+    suivantEl.textContent = '\u2713';
+    suivantEl.style.color = '#2ecc71';
+  }
+}
+
+function pollConduite() {
+  fetch('/conduite_status').then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) {
+      dernierRpm = d.rpm;
+      document.getElementById('rpmVal').textContent = Math.round(d.rpm);
+      majAiguille(d.rpm);
+    }
+    if (d.rapport !== dernierRapport) { dernierRapport = d.rapport; dessinerGauge(); }
+    majRapportAffiche();
+  });
+}
+
+function retourAccueil() {
+  fetch('/conduite_stop').then(function() { window.location.href = '/'; });
+}
+window.addEventListener('beforeunload', function() {
+  navigator.sendBeacon && navigator.sendBeacon('/conduite_stop');
+});
+
+dessinerGauge();
+fetch('/conduite_start').then(function() {
+  pollTimer = setInterval(pollConduite, 200);
+  boucleAudioC();
+});
+</script>
+</body></html>
+)rawliteral";
+
 /* ---------- HTML Principal ---------------------------------- */
 const char* HTML_INDEX = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>NEMO OBD - FW 8.13</title>
+  <title>NEMO OBD - FW 8.17</title>
   <style>
     body { font-family: Arial, sans-serif; text-align: center; background: #000; color: #fff; padding: 20px; }
     h1, h2 { color: #fff; }
@@ -1547,6 +1785,7 @@ const char* HTML_INDEX = R"rawliteral(
   </style>
 </head>
 <body>
+  <a href="/" style="color:#888;font-size:13px;">&larr; Accueil</a>
   <h2>Log continu</h2>
   <button id="btnLog" onclick="toggleLog()">LOG</button>
   <div id="logStatus">Arrete</div>
@@ -1562,6 +1801,7 @@ const char* HTML_INDEX = R"rawliteral(
     <div>Norme OBD : <span id="n1c" style="color:#fff;">--</span></div>
     <div>Moniteurs depuis effacement : <span id="n01" style="color:#fff;">--</span></div>
     <div>Moniteurs cycle actuel : <span id="n41" style="color:#fff;">--</span></div>
+    <div>Rapport estime (pneu 185/65 R15) : <span id="rapport" style="color:#fff;font-weight:bold;">--</span></div>
   </div>
 
   <h2>Defauts</h2>
@@ -1576,7 +1816,7 @@ const char* HTML_INDEX = R"rawliteral(
 
   <hr style="border-color:#333; margin:30px 0;">
 
-  <h1>Scan PID - ECU 0x10 (Nemo C-CAN) - FW 8.13</h1>
+  <h1>Scan PID - ECU 0x10 (Nemo C-CAN) - FW 8.17</h1>
   <button id="btnCall" onclick="startCall()">CALL</button>
   <br><br>
   <button id="btnTest" onclick="testPid()">TEST PID 0x0C</button>
@@ -1746,6 +1986,7 @@ const char* HTML_INDEX = R"rawliteral(
         document.getElementById('n1c').textContent = d.norme1c;
         document.getElementById('n01').textContent = d.statut01;
         document.getElementById('n41').textContent = d.statut41;
+        document.getElementById('rapport').textContent = d.rapport > 0 ? d.rapport : '--';
       });
     }
 
@@ -1938,7 +2179,15 @@ void setup() {
   WiFi.softAPConfig(AP_IP, AP_IP, AP_MASK);
 
   server.on("/", HTTP_GET, []() {
+    server.send(200, "text/html", HTML_ACCUEIL);
+  });
+
+  server.on("/diag", HTTP_GET, []() {
     server.send(200, "text/html", HTML_INDEX);
+  });
+
+  server.on("/conduite", HTTP_GET, []() {
+    server.send(200, "text/html", HTML_CONDUITE);
   });
 
   server.on("/download", HTTP_GET, []() {
@@ -2096,7 +2345,31 @@ void setup() {
               ",\"num\":" + String(derniereNum[i], 2) + ",\"txt\":\"" + derniereVal[i] + "\"}";
     }
     json += "],\"norme1c\":\"" + normeObd + "\",\"statut01\":\"" + statutMoniteursDepuis +
-            "\",\"statut41\":\"" + statutMoniteursCycle + "\"}";
+            "\",\"statut41\":\"" + statutMoniteursCycle + "\",\"rapport\":" + String(rapportEstime) + "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/conduite_start", HTTP_GET, []() {
+    if (logMode != LOG_IDLE) {
+      server.send(200, "application/json", "{\"ok\":false,\"raison\":\"log de conduite en cours\"}");
+      return;
+    }
+    rpmConduiteOk = false;
+    vitesseConduiteOk = false;
+    conduitePhase = 0;
+    logMode = LOG_CONDUITE;
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/conduite_stop", HTTP_GET, []() {
+    if (logMode == LOG_CONDUITE) logMode = LOG_IDLE;
+    server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/conduite_status", HTTP_GET, []() {
+    String json = "{\"rpm\":" + String(rpmConduiteOk ? rpmConduite : 0, 1) +
+                  ",\"ok\":" + String(rpmConduiteOk ? "true" : "false") +
+                  ",\"rapport\":" + String(rapportEstime) + "}";
     server.send(200, "application/json", json);
   });
 
@@ -2179,6 +2452,26 @@ void loop() {
     return;
   }
 
+  if (logMode == LOG_CONDUITE) {
+    uint32_t respId; uint8_t data[8]; uint8_t len; uint8_t buf;
+    uint8_t pid = (conduitePhase == 0) ? 0x0C : 0x0D;
+    bool ok = testerUnPid(pid, respId, data, len, buf);
+    if (ok && len >= 3 && data[1] == 0x41) {
+      float v;
+      if (getNumeric(pid, data, len, v)) {
+        if (pid == 0x0C) { rpmConduite = v; rpmConduiteOk = true; }
+        else { vitesseConduite = v; vitesseConduiteOk = true; }
+      }
+    } else {
+      if (pid == 0x0C) rpmConduiteOk = false; else vitesseConduiteOk = false;
+    }
+    if (rpmConduiteOk && vitesseConduiteOk) {
+      rapportEstime = estimerRapport(rpmConduite, vitesseConduite);
+    }
+    conduitePhase = 1 - conduitePhase;
+    return;   // toujours rien d'autre : pas de pedale, pas de log fichier
+  }
+
   uint8_t pid = MONITOR_PIDS[pidIndex];
   Serial.printf("[DBG] round pid=0x%02X idx=%u mode=%d heap=%u t=%lu\n",
                 pid, pidIndex, (int)logMode, ESP.getFreeHeap(), millis());
@@ -2239,6 +2532,9 @@ void loop() {
   pidIndex++;
   if (pidIndex >= NB_MONITOR) {
     pidIndex = 0;
+    if (derniereOk[IDX_REGIME] && derniereOk[IDX_VITESSE]) {
+      rapportEstime = estimerRapport(derniereNum[IDX_REGIME], derniereNum[IDX_VITESSE]);
+    }
     if (logMode == LOG_RAFALE && millis() > rafaleFinMs) {
       Serial.println("[DBG] fin RAFALE -> NORMAL");
       logMode = LOG_NORMAL;
