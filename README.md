@@ -76,6 +76,13 @@ Le MCP2515 est configuré avec un masque/filtre matériel qui n'accepte que les 
 - Bouton **PURGER LOG** (supprime le journal sans passer par le téléchargement ; refusé si un log est en cours).
 - Téléchargement séparé (`/download_log`), fichier `nemo_drivelog.csv`.
 
+### Statuts moniteurs (niveau 2, sans bouton)
+
+Affiché sous les jauges, mis à jour automatiquement, aucune interaction requise :
+
+- **Norme OBD** (`0x1C`) — interrogée **une seule fois au démarrage** (valeur statique, ne change jamais pour un véhicule donné).
+- **Moniteurs depuis effacement** (`0x01`) et **moniteurs cycle actuel** (`0x41`) — décodage bit à bit (MIL, nombre de codes, type d'allumage, ratio moniteurs prêts/terminés sur moniteurs supportés), interrogés **toutes les 60 s**, jamais pendant une rafale.
+
 ### Scan PID (découverte des PID supportés)
 
 - Bouton **CALL**.
@@ -92,9 +99,9 @@ Le MCP2515 est configuré avec un masque/filtre matériel qui n'accepte que les 
 
 Table de correspondance (~155 entrées) couvrant les PID Mode 01 à formule linéaire simple (`valeur = mul × brut + add`, sur 1, 2 ou 4 octets, signé ou non, à un décalage donné dans la trame — gère aussi les PID à plusieurs valeurs comme `0x66` ou `0x9A`). Formules sourcées SAE J1979 / Wikipédia.
 
-**Non décodés (affichés en "Brut")** : les PID à champs encodés bit à bit avec table de correspondance énumérée — `0x00, 0x01, 0x03, 0x12, 0x13, 0x1C, 0x1D, 0x1E, 0x41, 0x51, 0x5F` et assimilés. Mécanisme différent (extraction de bits + table de libellés), non implémenté à ce stade.
+**Non décodés (affichés en "Brut")** : les PID à champs encodés bit à bit restants, non couverts par le niveau 2 ci-dessus — `0x00`, `0x03`, `0x12`, `0x13`, `0x1D`, `0x1E`, `0x51`, `0x5F` et assimilés. `0x01`, `0x1C` et `0x41` sont décodés séparément (voir "Statuts moniteurs" ci-dessus).
 
-**Anomalie documentée, pas un bug** : le PID `0x01` (octet B, bit 3 — type d'allumage) répond "essence" sur ce véhicule diesel. Le bit est lu conformément à la norme (vérifié par triangulation de sources) ; c'est l'ECU Marelli qui répond ainsi, pas une erreur de décodage.
+**Anomalie documentée, pas un bug** : le PID `0x01` (octet B, bit 3 — type d'allumage) répond "essence" sur ce véhicule diesel. Le bit est lu conformément à la norme (vérifié par triangulation de sources, cohérent avec les données réelles capturées) ; c'est l'ECU Marelli qui répond ainsi, pas une erreur de décodage.
 
 ## Fiabilité — problèmes rencontrés et corrections
 
@@ -109,26 +116,31 @@ Une instrumentation de debug (`Serial.print`, 115200 bauds) reste en place dans 
 
 ## Compilation
 
-./obd_build.sh flash ( puis ./obd_build.sh mon )
-
-ou
 ```bash
+ ./obd_build.sh flash
+ ./obd_build.sh mon
+
+ou 
+
 arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32S3 obd_can_bridge.ino
 arduino-cli upload  --fqbn esp32:esp32:XIAO_ESP32S3 -p /dev/ttyACM0 obd_can_bridge.ino
 ```
 
-
 Aucune bibliothèque tierce à installer.
 
-## Reste à faire ( fait en 8.11, a tester... )
+## Défauts (DTC)
 
-- Décodage niveau 2 (PID à bits énumérés : `0x01`, `0x1C`, `0x41`, etc.)
-- Bouton **CLEAR** (Mode 04 — effacement défauts), validé faisable, pas encore codé. Attention : réinitialise aussi les moniteurs de conformité ("readiness"), nécessite un cycle de conduite complet pour redevenir "prêt".
-- Lecture DTC (Mode 03/07/0A)
+- **CHECK DEFAUTS** : lit Mode 03 (mémorisés), 07 (en attente), 0A (permanents) en broadcast. Limite assumée : 3 codes max par mode (trame simple ISO-TP uniquement, pas de multi-trame — au-delà, non testable de toute façon sur un usage réel).
+- **CLEAR DEFAUTS** : Mode 04, confirmation JS obligatoire (rappel de l'effet sur les moniteurs readiness). Refusé par l'ECU (NRC `22`) si le moteur tourne — comportement standard, confirmé sur ce véhicule.
+- Chaque code décodé (`P`/`C`/`B`/`U` + 4 chiffres) est accompagné de sa description en français, via une table de **986 codes génériques** embarquée dans le firmware (source : PDF de traduction EOBD-Facile, vérifiée et corrigée : un conflit de contenu tranché par contrôle visuel du document, plusieurs décalages de mise en page corrigés, 3 codes exclus car non définis dans la source).
+
+## Reste à faire
+
+- Rien d'identifié pour l'instant côté fonctionnalités DTC/défauts.
 
 ## Licence
 
 Usage personnel.
 
-**Auteur : Eric Perret (F1OCM)**
+**Auteur : Eric Perret (FY4AY/ex:F1OCM)**
 Projet développé et maintenu pour le diagnostic du Citroën Nemo 1.3 HDi.
