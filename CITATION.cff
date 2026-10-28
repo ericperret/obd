@@ -1,0 +1,42 @@
+# ==============================================================================
+#  Nom / Name : CITATION.cff
+#  Projet     : obd — https://github.com/ericperret/obd
+#  Auteur     : Eric PERRET
+#  Date       : 2026-10-27
+#  Version    : 1.0
+#  Objet      : métadonnées de citation (bouton « Cite this repository » de GitHub)
+#  Licence    : CC BY-NC 4.0 — usage commercial sur autorisation écrite (eperret@azs.fr)
+# ==============================================================================
+cff-version: 1.2.0
+message: "If you use or cite this work, please credit it as below. / Merci de citer ce travail comme ci-dessous."
+type: software
+title: "obd_can_bridge — standalone OBD-II bridge on ESP32-S3"
+abstract: "Standalone OBD-II diagnostic bridge on ESP32-S3 with built-in WiFi web interface. MCP2515 driven by raw SPI registers, ISO 15765-4 29-bit, live PIDs, no external library."
+authors:
+  - family-names: "PERRET"
+    given-names: "Eric"
+    email: "eperret@azs.fr"
+repository-code: "https://github.com/ericperret/obd"
+url: "https://github.com/ericperret/obd"
+license: CC-BY-NC-4.0
+date-released: "2026-10-27"
+keywords:
+  - obd2
+  - obd-ii
+  - can-bus
+  - canbus
+  - mcp2515
+  - esp32
+  - esp32-s3
+  - seeed-xiao
+  - arduino
+  - iso15765-4
+  - automotive
+  - car-diagnostics
+  - vehicle-diagnostics
+  - embedded
+  - wifi
+  - web-interface
+  - no-dependencies
+  - car
+  - automotive-analytics

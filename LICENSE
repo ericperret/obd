@@ -1,0 +1,103 @@
+================================================================================
+  Nom / Name   : LICENSE
+  Projet       : obd — https://github.com/ericperret/obd
+  Auteur       : Eric PERRET
+  Date         : 2026-10-27
+  Version      : 2.0
+  Licence      : CC BY-NC 4.0 + autorisation écrite pour tout usage commercial
+                 CC BY-NC 4.0 + written permission for any commercial use
+================================================================================
+
+Copyright (c) 2026 Eric PERRET — https://github.com/ericperret/obd
+
+--------------------------------------------------------------------------------
+FRANÇAIS
+--------------------------------------------------------------------------------
+
+1. Licence
+
+Ce projet (code source, documentation, images et fichiers associés) est mis à
+disposition selon les termes de la licence Creative Commons Attribution – Pas
+d'Utilisation Commerciale 4.0 International (CC BY-NC 4.0).
+
+  Résumé      : https://creativecommons.org/licenses/by-nc/4.0/deed.fr
+  Texte légal : https://creativecommons.org/licenses/by-nc/4.0/legalcode.fr
+
+2. Usage libre non commercial
+
+Vous pouvez gratuitement utiliser, copier, redistribuer et modifier ce projet,
+sous tout format, pour tout usage non commercial (personnel, associatif,
+enseignement, recherche, service public non marchand).
+
+3. Mention obligatoire de la source et de l'auteur
+
+Toute utilisation, copie, modification ou redistribution, totale ou partielle,
+doit mentionner de façon visible :
+
+  obd — Eric PERRET — https://github.com/ericperret/obd
+
+et indiquer si des modifications ont été apportées.
+
+4. Usage commercial interdit sans autorisation écrite
+
+Toute utilisation commerciale (vente, intégration dans un produit ou un service
+payant, prestation rémunérée, usage interne d'une entreprise à but lucratif)
+est interdite sans l'autorisation écrite préalable de l'auteur, donnée par
+courrier électronique. Demande à adresser à : eperret@azs.fr
+
+5. Données et services tiers
+
+Cette licence ne couvre ni les données ni les services externes utilisés par
+le projet (fonds de carte, météo, modèles numériques de terrain, données
+publiques…), qui restent soumis à leurs propres conditions.
+
+6. Absence de garantie
+
+Le projet est fourni « tel quel », sans garantie d'aucune sorte. L'auteur ne
+peut être tenu responsable d'aucun dommage résultant de son utilisation.
+
+--------------------------------------------------------------------------------
+ENGLISH
+--------------------------------------------------------------------------------
+
+1. License
+
+This project (source code, documentation, images and related files) is made
+available under the terms of the Creative Commons Attribution-NonCommercial
+4.0 International license (CC BY-NC 4.0).
+
+  Summary    : https://creativecommons.org/licenses/by-nc/4.0/
+  Legal code : https://creativecommons.org/licenses/by-nc/4.0/legalcode
+
+2. Free non-commercial use
+
+You may use, copy, redistribute and modify this project free of charge, in any
+format, for any non-commercial purpose (personal, non-profit, teaching,
+research, non-market public service).
+
+3. Mandatory credit of the source and the author
+
+Any use, copy, modification or redistribution, in whole or in part, must
+visibly credit:
+
+  obd — Eric PERRET — https://github.com/ericperret/obd
+
+and indicate whether changes were made.
+
+4. Commercial use forbidden without written permission
+
+Any commercial use (sale, inclusion in a paid product or service, paid
+services, internal use by a for-profit company) is forbidden without the
+author's prior written permission, given by e-mail. Requests to:
+eperret@azs.fr
+
+5. Third-party data and services
+
+This license covers neither the data nor the external services used by the
+project (base maps, weather, digital elevation models, public data…), which
+remain subject to their own terms.
+
+6. No warranty
+
+The project is provided "as is", without warranty of any kind. The author
+cannot be held liable for any damage arising from its use.
